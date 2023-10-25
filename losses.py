@@ -39,6 +39,7 @@ def get_accuracy(
     else:
         raise ValueError(f"Unknown reduce option: {reduce}")
 
+
 @jtu.Partial
 def mean_squared_loss_fn(
     model: eqx.Module, state: eqx.nn.State, batch: Dict[str, Array], *, key: Array
@@ -63,9 +64,14 @@ def mean_squared_loss_fn(
     return jnp.mean(loss), (state, log_data)
 
 
-@jtu.Partial
 def classification_loss_fn(
-    model: eqx.Module, state: eqx.nn.State, batch: Dict[str, Array], *, key: Array
+    model: eqx.Module,
+    state: eqx.nn.State,
+    batch: Dict[str, Array],
+    input_key="input_ids",
+    target_key="labels",
+    *,
+    key: Array,
 ):
     def single_example_loss_fn(input, target, state):
         logits, state = model(input, state=state, key=key)
@@ -78,8 +84,8 @@ def classification_loss_fn(
         axis_name="batch",
         out_axes=(0, 0, None),
     )
-    input = batch["input_ids"]
-    target = batch["labels"]
+    input = batch[input_key]
+    target = batch[target_key]
     loss, logits, new_state = vmapped_loss_fn(input, target, state)
 
     accuracy = get_accuracy(logits, target)
@@ -92,4 +98,8 @@ def classification_loss_fn(
 
     return loss, (state, log_data)
 
+LOSS_FN_REGISTRY={}
+LOSS_FN_REGISTRY["lm_classification"] = jtu.Partial(classification_loss_fn)
+LOSS_FN_REGISTRY["tuple_classification"] = jtu.Partial(classification_loss_fn, input_key=0, target_key=1)
+LOSS_FN_REGISTRY["mean_squared_loss"] = mean_squared_loss_fn
 

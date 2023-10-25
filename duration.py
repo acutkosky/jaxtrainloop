@@ -1,4 +1,11 @@
 import time
+import numpy as np
+import equinox as eqx
+
+def safe(x):
+    if eqx.is_array(x):
+        return np.array(x)
+    return x
 
 
 
@@ -70,38 +77,19 @@ class Duration:
     def __str__(self):
         return f"{[str(d) for d in self.durations]}"
 
-def min_duration(*durations):
-    result = Duration("")
-
-    for d in durations:
-        result.epochs = min(result.epochs, d.epochs)
-        result.iterations = min(result.iterations, d.iterations)
-        result.minutes = min(result.minutes, d.minutes)
-
-    curtime = time.time() / 60
-    result.start_time = curtime
-    result.start_iterations = result.iterations
-    result.start_epochs = result.epochs
-    for d in durations:
-        if d.minutes != float("inf"):
-            end_time = d.start_time + d.minutes
-            result.start_time = min(result.start_time, end_time - result.minutes)
-
-        if d.epochs != float("inf"):
-            end_epochs = d.start_epochs + d.epochs
-            result.start_epochs = min(result.start_epochs, end_epochs - result.epochs)
-
-        if d.iterations != float("inf"):
-            end_iterations = d.start_iterations + d.iterations
-            result.start_iterations = min(
-                result.start_iterations, end_iterations - result.iterations
-            )
-
-    return result
 
 
 class _Duration:
     def __init__(self, spec):
+        if isinstance(spec, Duration):
+            self.epochs = spec.epochs
+            self.iterations = spec.iterations
+            self.minutes = spec.minutes
+            self.start_epochs = spec.start_epochs
+            self.start_iterations = spec.start_iterations
+            self.start_time = spec.start_time
+            return
+
         self.epochs = float("inf")
         self.iterations = float("inf")
         self.minutes = float("inf")
@@ -131,8 +119,8 @@ class _Duration:
 
     def reset(self, epoch: int = 0, iterations: int = 0):
         self.start_time = time.time() / 60
-        self.start_epochs = epoch
-        self.start_iterations = iterations
+        self.start_epochs = safe(epoch)
+        self.start_iterations = safe(iterations)
 
     def elapsed_and_reset(self, epoch: int, iterations: int):
         result = self.elapsed(epoch, iterations)

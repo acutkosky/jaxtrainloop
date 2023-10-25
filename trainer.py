@@ -20,7 +20,9 @@ import ml_dtypes
 import wandb
 from collections import defaultdict
 import time
-from duration import Duration, min_duration
+from duration import Duration
+
+import numpy as np
 
 
 from dataset_lookup import get_loader
@@ -80,9 +82,9 @@ def train_step(
     optimizer = train_state.optimizer
 
     if config.use_amp:
-        amp_loss_fn = amp(loss_fn, compute_dtype=get_dtype(config.precision))
+        # amp_loss_fn = amp(loss_fn, compute_dtype=get_dtype(config.precision))
         value_and_grad_fn = dynamic_scale_value_and_grad(
-            amp_loss_fn, filter=True, has_aux=True, redo_on_nan=0
+            loss_fn, filter=True, has_aux=True, redo_on_nan=0
         )
         dynamic_scaler_state, (
             (loss, (model_state, log_data)),
@@ -114,7 +116,9 @@ def train_step(
         epoch=train_state.epoch,
     )
 
-    log_data["grads/norm"] = tree_norm(grads)
+    if config.log_norms:
+        log_data["norms/grads"] = tree_norm(grads)
+        log_data["norms/params"] = tree_norm(model)
 
     return loss, log_data, new_train_state
 
@@ -135,7 +139,7 @@ class ExpAvg:
 
 
 class TimeKeeper:
-    def __init__(self, window_size=100):
+    def __init__(self, window_size=10):
         self.timestamps = {}
         self.average_durations = defaultdict(lambda: ExpAvg(window_size))
         self.periods = defaultdict(lambda: ExpAvg(window_size))
@@ -192,7 +196,6 @@ def run_epoch(
     logger: Callable,
     key: Array,
 ):
-    epoch = train_state.epoch
     mode = mode.lower()
     # pbar = tqdm.tqdm(enumerate(dataloader), total=config.train.max_steps)
 
@@ -201,6 +204,7 @@ def run_epoch(
     if mode == "train":
         step_fn_jit = eqx.filter_jit(
             jtu.Partial(train_step, loss_fn=loss_fn, config=config.train),
+            donate='all',
         )
         train_state = eqx.tree_at(
             lambda t: t.model,
@@ -210,6 +214,7 @@ def run_epoch(
     else:
         step_fn_jit = eqx.filter_jit(
             jtu.Partial(inference_step, loss_fn=loss_fn, config=config.train),
+            donate='all',
         )
         train_state = eqx.tree_at(
             lambda t: t.model,
@@ -220,13 +225,17 @@ def run_epoch(
     exhausted_loader = True
     iteration_timing_events = ["iteration", "dataloader", "train_step"]
     time_keeper.mark(start_events=["dataloader", "iteration", "tokens", "samples"])
-    start_iter = train_state.iteration
+    start_iter = np.array(train_state.iteration)
     it = -1
     while True:
         try:
             idt, batch = next(dataloader)
         except StopIteration:
             break
+        if "attention_mask" in batch:
+            tokens = util.count_tokens(batch["attention_mask"])
+        else:
+            tokens = None
         # for batch in dataloader:
         it += 1
         batch = util.pytorch_to_np(batch)
@@ -234,14 +243,14 @@ def run_epoch(
         to_use, key = jr.split(key)
         loss, log_data, train_state = step_fn_jit(train_state, batch, key=key)
 
+
         time_keeper.mark(
             end_events={"train_step": 1},
         )
 
         #### Record metrics that should be tagged with the current mode ####
 
-        if "attention_mask" in batch:
-            tokens = util.count_tokens(batch["attention_mask"])
+        if tokens is not None:
             log_data["tokens"] = tokens
         if "tokens" in log_data:
             total_tokens += log_data["tokens"]
@@ -251,7 +260,7 @@ def run_epoch(
         log_data["loss"] = loss
 
         pbar_desc = ", ".join(
-            [f"epoch: {train_state.epoch}"]
+            [f"{mode} epoch: {train_state.epoch}"]
             + [f"{k}: {v}" for k, v in log_data.items()]
             + [f"total_iter: {train_state.iteration}"]
         )
@@ -272,6 +281,11 @@ def run_epoch(
                 if k in durations
             }
         )
+
+        if train_state.dynamic_scaler_state is not None:
+            log_data.update({
+                f"dynamic_scaler": np.array(train_state.dynamic_scaler_state.scaler)
+            })
         log_data.update(
             {
                 f"time/fraction_spent/{k}": proportions[k]
@@ -293,21 +307,18 @@ def run_epoch(
         log_data = {f"{mode}/{k}": v for k, v in log_data.items()}
 
         #### Record metrics that should NOT be tagged with the current mode ####
-        log_data["epoch"] = epoch
-        log_data["total_iter"] = train_state.iteration
+        log_data["epoch"] = np.array(train_state.epoch)
+        log_data["total_iter"] = np.array(train_state.iteration)
 
         if config.train.wandb_project is not None:
             logger(
                 log_data,
-                step=train_state.iteration,
             )
 
-        if stop_time.elapsed(epoch, it + start_iter + 1):
+        if stop_time.elapsed(np.array(train_state.epoch), it + start_iter + 1):
             exhausted_loader = False
             break
 
-    if exhausted_loader:
-        train_state = eqx.tree_at(lambda t: t.epoch, train_state, train_state.epoch + 1)
 
     return train_state, key, exhausted_loader
 
@@ -429,13 +440,20 @@ def train(config: DictConfig) -> None:
 
     time_keeper = TimeKeeper()
 
-    loss_fn = losses.classification_loss_fn
+    loss_fn = losses.LOSS_FN_REGISTRY[config.train.loss_fn]
+    if config.train.use_amp:
+        loss_fn = amp(loss_fn, compute_dtype=get_dtype(config.train.precision))
 
     train_pbar = tqdm.tqdm(enumerate(data_loaders["train"]))
     train_loader = iter(train_pbar)
     if config.train.valid_key is not None:
         valid_pbar = tqdm.tqdm(enumerate(data_loaders[config.train.valid_key]))
         valid_loader = iter(valid_pbar)
+
+
+    total_duration.reset()
+    valid_duration.reset()
+    valid_freq.reset()
 
     while True:
         # train...
@@ -457,6 +475,9 @@ def train(config: DictConfig) -> None:
             )
             train_pbar = tqdm.tqdm(enumerate(data_loaders["train"]))
             train_loader = iter(train_pbar)
+        else:
+            # make a newline so that the progress bar has a new line too...
+            print("\n")
 
         if valid_freq.elapsed_and_reset(train_state.epoch, train_state.iteration):
             if config.train.valid_key is not None:

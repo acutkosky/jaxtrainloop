@@ -401,7 +401,7 @@ class ResNet(nn.StatefulLayer):
 
         return nn.Sequential(layers), inplanes
 
-    def __call__(self, x: jax.Array, state: nn.State) -> jax.Array:
+    def __call__(self, x: jax.Array, state: nn.State, *, key: Optional[jax.Array]=None) -> jax.Array:
         x = self.conv1(x)
         x, state = self.bn1(x, state)
         x = jax.nn.relu(x)

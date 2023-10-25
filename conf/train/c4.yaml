@@ -1,0 +1,40 @@
+
+defaults:
+  - optim: adamw
+
+total_duration: "12hr"
+valid_frequency: "1hr"
+valid_duration: "5min"
+
+dataset: "c4"
+data_path: "/projectnb/aclab/datasets/c4/en/"
+
+valid_key: "validation"
+test_key: "test"
+
+
+loss_fn: lm_classification
+batch_size: 4 # number of examples placed on each GPU
+
+# whether to use automatic mixed precision
+use_amp: True
+# value to cast to in mixed precision training.
+precision: float16
+
+wandb_project: null
+wandb_logs_per_sec: 1.0
+
+log_norms: True
+
+# this will slow down computation a bit (I believe due to extra GPU/CPU communication),
+# but will log more stuff (like learning rates).
+# Still working on nice way to do this logging - we really should only incur one communication
+# round per iteration and I don't think the logging data should significantly impact it.
+log_callback_data: True
+
+
+dataloader_workers: 2
+  
+
+
+

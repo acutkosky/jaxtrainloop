@@ -29,7 +29,8 @@ def reduce_state(state, new_state, reduce_fn=lambda x: jnp.mean(x, axis=0)):
 def tree_norm(tree):
     return jnp.sqrt(
         jtu.tree_reduce(
-            lambda x, y: x + y, jtu.tree_map(lambda x: jnp.sum(x * x), tree)
+            lambda x, y: x + y,
+            jtu.tree_map(lambda x: jnp.sum(x * x), eqx.filter(tree, eqx.is_array)),
         )
     )
 

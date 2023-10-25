@@ -24,11 +24,13 @@ MODEL_REGISTRY["gpt"] = load_gpt
 def load_resnet(
     config: DictConfig, dataloaders: Any, *, key
 ) -> Tuple[eqx.Module, eqx.nn.State]:
-    if config.model == "torch_resnet18":
+    if config.name == "torch_resnet18":
         model_fn = resnet18
-    elif config.model == "kuangliu_resnet18" or config.model == "resnet18":
+    elif config.name in ["kuangliu_resnet18", "resnet18"]:
         model_fn = alt_resnet18
     model, state = eqx.nn.make_with_state(model_fn)(
-        num_classes=config.model.num_classes, bn_momentum=config.model.bn_mom, key=key
+        num_classes=config.num_classes, bn_momentum=config.bn_momentum, key=key
     )
     return model, state
+for name in ["resnet18", "torch_resnet18", "kuangliu_resnet18"]:
+    MODEL_REGISTRY[name] = load_resnet

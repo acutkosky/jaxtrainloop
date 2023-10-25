@@ -1,0 +1,22 @@
+
+
+# clip the gradient to have l2 norm at most this value
+gradient_clip_val: 1.0
+
+# lr schedule shape and scale
+lr_warmup: 0.1
+lr_decay: linear
+lr: 0.1
+
+weight_decay: 5e-4
+
+# options for mechanic
+mechanize: False
+mech_lambda: 0.01
+# whether to apply the schedule before mechanic (True) or after mechanic (False)
+bake_schedule: True
+
+name: "sgd"
+
+momentum: 0.9
+

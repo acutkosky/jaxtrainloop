@@ -1,0 +1,5 @@
+name: resnet18
+
+
+num_classes: 10
+bn_momentum: 0.9
