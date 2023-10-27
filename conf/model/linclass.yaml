@@ -1,0 +1,5 @@
+
+name: linear
+
+use_bias: True
+zero_init: True

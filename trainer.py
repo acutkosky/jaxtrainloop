@@ -24,6 +24,7 @@ from duration import Duration
 
 import numpy as np
 
+from timekeeper import TimeKeeper
 
 from dataset_lookup import get_loader
 from model_lookup import get_model
@@ -60,8 +61,8 @@ def inference_step(
     model = train_state.model
     model_state = train_state.model_state
 
-    if config.use_amp:
-        loss_fn = amp(loss_fn, compute_dtype=get_dtype(config.precision))
+    # if config.use_amp:
+    #     loss_fn = amp(loss_fn, compute_dtype=get_dtype(config.precision))
 
     loss, (model_state, log_data) = loss_fn(model, model_state, batch, key=key)
 
@@ -122,50 +123,6 @@ def train_step(
 
     return loss, log_data, new_train_state
 
-
-class ExpAvg:
-    def __init__(self, window_size):
-        self.A = 0.0
-        self.beta = 1.0 - 1.0 / window_size
-        self.count = 0
-
-    def update(self, value):
-        self.A = self.A * self.beta + (1.0 - self.beta) * value
-        self.count += 1
-
-    @property
-    def value(self):
-        return self.A / (1.0 - self.beta ** (self.count + 1))
-
-
-class TimeKeeper:
-    def __init__(self, window_size=10):
-        self.timestamps = {}
-        self.average_durations = defaultdict(lambda: ExpAvg(window_size))
-        self.periods = defaultdict(lambda: ExpAvg(window_size))
-
-    def mark(self, start_events=[], end_events={}):
-        cur_time = time.time()
-        for e, c in end_events.items():
-            if c > 0:
-                delta = (cur_time - self.timestamps[e]) / c
-                self.average_durations[e].update(delta)
-        for s in start_events:
-            if s in self.timestamps:
-                delta = cur_time - self.timestamps[s]
-                self.periods[s].update(delta)
-            self.timestamps[s] = cur_time
-
-        return cur_time
-
-    def get_durations(self):
-        return {k: v.value for k, v in self.average_durations.items()}
-
-    def get_proportions(self):
-        return {
-            k: self.average_durations[k].value / self.periods[k].value
-            for k in self.periods
-        }
 
 
 class RateLimitedWandbLog:
@@ -322,77 +279,6 @@ def run_epoch(
 
     return train_state, key, exhausted_loader
 
-
-def schedule_fn(
-    max_iter: int,
-    warmup_iter: int,
-    peak: float,
-    count: int,
-    logger: Optional[RateLimitedWandbLog] = None,
-):
-    result = peak * jax.lax.select(
-        count < warmup_iter,
-        count / warmup_iter,
-        (max_iter - count) / (max_iter - warmup_iter),
-    )
-    if logger is not None:
-        jax.experimental.io_callback(
-            logger, None, {"lr/schedule": result}, commit=False
-        )
-    return result
-
-
-def init_optimizer(
-    model: eqx.Module,
-    config: DictConfig,
-    logger: Optional[RateLimitedWandbLog] = None,
-):
-    if not config.log_callback_data:
-        logger = None
-    total_steps = config.max_steps
-    schedule = jtu.Partial(
-        schedule_fn, total_steps, config.lr_warmup, 1.0, logger=logger
-    )
-    if config.bake_schedule:
-        base_schedule = schedule
-    else:
-        base_schedule = 1.0
-
-    if config.optimizer == "sgd":
-        optimizer = optax.chain(
-            optax.add_decayed_weights(config.wd),
-            optax.sgd(learning_rate=base_schedule, momentum=config.mom),
-        )
-    elif config.optimizer == "adamw":
-        optimizer = optax.adamw(
-            learning_rate=base_schedule, weight_decay=config.weight_decay
-        )
-
-    if config.mechanize:
-        optimizer = optax.contrib.mechanize(optimizer, weight_decay=config.mech_lambda)
-        if logger is not None:
-
-            def log_fn(updates, state, params):
-                jax.experimental.io_callback(
-                    logger, None, {"mechanic/s": jnp.sum(state.s)}, commit=False
-                )
-
-            optimizer = log_optax(optimizer, log_fn)
-
-    else:
-        optimizer = optax.chain(optimizer, optax.scale(config.lr))
-
-    if not config.bake_schedule:
-        optimizer = optax.chain(optimizer, optax.scale_by_schedule(schedule))
-
-    optimizer = optax.apply_if_finite(optimizer, 15)
-
-    # we do gradient clipping before anything else
-    grad_clip = optax.clip_by_global_norm(config.gradient_clip_val)
-    optimizer = optax.chain(grad_clip, optimizer)
-
-    opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
-    return optimizer, opt_state
 
 
 @hydra.main(version_base=None, config_path="conf", config_name="config_gpt2")

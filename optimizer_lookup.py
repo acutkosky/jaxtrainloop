@@ -34,10 +34,20 @@ def schedule_fn(
 
     warmup = config.lr_warmup
 
+    fraction_remaining = (1 - train_elapsed) / (1 - warmup)
+    if config.lr_decay == 'linear':
+        decay_value = fraction_remaining
+    elif config.lr_decay == 'cosine':
+        decay_value = jnp.cos(fraction_remaining * jnp.pi)*0.5 + 0.5
+    else:
+        decay_value = 1.0
+        
+        
+
     result = peak * jax.lax.select(
         train_elapsed < warmup,
         train_elapsed / warmup,
-        (1 - train_elapsed) / (1 - warmup),
+        decay_value,
     )
     if logger is not None:
         jax.experimental.io_callback(
@@ -55,32 +65,33 @@ def get_optimizer(
 ):
     if not config.log_callback_data:
         logger = None
-    total_steps = config.max_steps
+    # total_steps = config.max_steps
+    opt_config  = config.optim
     schedule = jtu.Partial(
         schedule_fn,
         loader=train_loader,
         train_duration=train_duration,
-        config=config,
-        peak=1.0,
+        config=opt_config,
+        peak=opt_config.lr,
         logger=logger,
     )
-    if config.bake_schedule:
+    if opt_config.bake_schedule:
         base_schedule = schedule
     else:
         base_schedule = 1.0
 
-    if config.optimizer == "sgd":
+    if opt_config.name == "sgd":
         optimizer = optax.chain(
-            optax.add_decayed_weights(config.wd),
-            optax.sgd(learning_rate=base_schedule, momentum=config.mom),
+            optax.add_decayed_weights(opt_config.weight_decay),
+            optax.sgd(learning_rate=base_schedule, momentum=opt_config.momentum),
         )
-    elif config.optimizer == "adamw":
+    elif opt_config.name == "adamw":
         optimizer = optax.adamw(
-            learning_rate=base_schedule, weight_decay=config.weight_decay
+            learning_rate=base_schedule, weight_decay=opt_config.weight_decay
         )
 
-    if config.mechanize:
-        optimizer = optax.contrib.mechanize(optimizer, weight_decay=config.mech_lambda)
+    if opt_config.mechanize:
+        optimizer = optax.contrib.mechanize(optimizer, weight_decay=opt_config.mech_lambda)
         if logger is not None:
 
             def log_fn(updates, state, params):
@@ -90,19 +101,20 @@ def get_optimizer(
 
             optimizer = log_optax(optimizer, log_fn)
 
-    else:
-        optimizer = optax.chain(optimizer, optax.scale(config.lr))
+    # else:
+    #     optimizer = optax.chain(optimizer, optax.scale(opt_config.lr))
 
-    if not config.bake_schedule:
+    if not opt_config.bake_schedule:
         optimizer = optax.chain(optimizer, optax.scale_by_schedule(schedule))
-        # if not config.mechanize:
-        #     optimizer = optax.chain(optimizer, optax.scale(config.lr))
+        # if not opt_config.mechanize:
+        #     optimizer = optax.chain(optimizer, optax.scale(opt_config.lr))
 
     optimizer = optax.apply_if_finite(optimizer, 15)
 
     # we do gradient clipping before anything else
-    grad_clip = optax.clip_by_global_norm(config.gradient_clip_val)
-    optimizer = optax.chain(grad_clip, optimizer)
+    if opt_config.gradient_clip_val is not None:
+        grad_clip = optax.clip_by_global_norm(opt_config.gradient_clip_val)
+        optimizer = optax.chain(grad_clip, optimizer)
 
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
     return optimizer, opt_state

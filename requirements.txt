@@ -14,4 +14,7 @@ tqdm
 optax
 equinox
 jaxamp
+openml
+oslo.concurrency
+
 
