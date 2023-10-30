@@ -7,7 +7,50 @@ def safe(x):
         return np.array(x)
     return x
 
+    
 
+class Time:
+    def __init__(self, *spec_string, **spec_dict):
+
+        # TODO: write this with regular expressions or something
+        # else less stupid
+        self.unit_to_value = dict(spec_dict)
+        for spec in spec_string:
+            if "ep" in spec:
+                self.unit_to_value["ep"] = int(spec.split("ep")[0])
+            if "it" in spec:
+                self.unit_to_value["it"] = int(spec.split("it")[0])
+            if "min" in spec:
+                self.unit_to_value["min"] = float(spec.split("min")[0])
+            if "hr" in spec:
+                self.unit_to_value["min"] = 60 * float(spec.split("hr")[0])
+
+    def _comparison(self, other, compfunc):
+        result = None
+
+        if len(self.unit_to_value) > len(other.unit_to_value):
+            raise ValueError("comparable Time objects must have same units!")
+
+      
+        for u in self.unit_to_value:
+            if u not in other.unit_to_value:
+                raise ValueError("comparable Time objects must have the same units!")
+            if result is None:
+                result = compfunc(self.unit_to_value[u], other.unit_to_value)
+            elif result != compfunc(self.unit_to_value[u], other.unit_to_value):
+                raise ValueError("ambiguous comparison among time objects!")
+        return result
+
+    def __ge__(self, other):
+        return self._comparison(other, lambda x,y: x >= y)
+    def __le__(self, other):
+        return other >= self
+
+    def __gt__(self, other):
+        return self._comparison(other, lambda x,y: x > y)
+    def __lt__(self, other):
+        return other > self
+    
 
 class Duration:
     def __init__(self, *specs):

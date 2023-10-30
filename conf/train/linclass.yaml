@@ -1,0 +1,46 @@
+defaults:
+  - optim: sgd
+
+optim.gradient_clip_val: null
+optim.lr_decay: null
+optim.lr_warmup: 0.0
+optim.weight_decay: 0.0
+
+total_duration: "200ep"
+valid_frequency: "1ep"
+valid_duration: "1ep"
+
+dataset: null
+
+cache_dir: "libsvm_cache"
+
+valid_key: "validation"
+test_key: "test"
+
+loss_fn: tuple_classification
+
+
+batch_size: 128 # number of examples placed on each GPU
+
+# whether to use automatic mixed precision
+use_amp: True
+# value to cast to in mixed precision training.
+precision: float16
+
+log_norms: True
+
+wandb_project: null
+wandb_logs_per_sec: 1.0
+
+# this will slow down computation a bit (I believe due to extra GPU/CPU communication),
+# but will log more stuff (like learning rates).
+# Still working on nice way to do this logging - we really should only incur one communication
+# round per iteration and I don't think the logging data should significantly impact it.
+log_callback_data: True
+
+
+dataloader_workers: 2
+  
+
+
+

@@ -55,7 +55,7 @@ def inference_step(
     train_state: TrainState,
     batch: Any,
     loss_fn: Callable,
-    key: PRNGKeyArray,
+    prng_key: PRNGKeyArray,
     config: Any,
 ):
     model = train_state.model
@@ -64,7 +64,7 @@ def inference_step(
     # if config.use_amp:
     #     loss_fn = amp(loss_fn, compute_dtype=get_dtype(config.precision))
 
-    loss, (model_state, log_data) = loss_fn(model, model_state, batch, key=key)
+    loss, (model_state, log_data) = loss_fn(model, model_state, batch, key=prng_key)
 
     return loss, log_data, train_state
 
@@ -73,7 +73,7 @@ def train_step(
     train_state: TrainState,
     batch: Any,
     loss_fn: Callable,
-    key: PRNGKeyArray,
+    prng_key: PRNGKeyArray,
     config: Any,
 ):
     model = train_state.model
@@ -94,13 +94,13 @@ def train_step(
             model,
             model_state,
             batch,
-            key=key,
+            key=prng_key,
             dynamic_scaler_state=dynamic_scaler_state,
         )
     else:
         value_and_grad_fn = eqx.filter_value_and_grad(loss_fn, has_aux=True)
         (loss, (model_state, log_data)), grads = value_and_grad_fn(
-            model, model_state, batch, key=key
+            model, model_state, batch, key=prng_key
         )
     updates, opt_state = optimizer.update(
         grads, opt_state, eqx.filter(model, eqx.is_array)
@@ -131,11 +131,15 @@ class RateLimitedWandbLog:
         self.last_time = time.time() - 1.0 / self.max_frequency
         self.metrics = {}
 
-    def __call__(self, metrics, *args, commit=True, **kwargs):
+    def __call__(self, metrics, *args, commit=True, force=False, **kwargs):
         self.metrics.update(metrics)
         if commit:
+            self.commit(force=force, *args, **kwargs)
+
+    def commit(self, force=False, *args, **kwargs):
+        if len(self.metrics) != 0:
             cur_time = time.time()
-            if cur_time >= self.last_time + 1.0 / self.max_frequency:
+            if force or cur_time >= self.last_time + 1.0 / self.max_frequency:
                 wandb.log(self.metrics, *args, **kwargs)
                 self.last_time = cur_time
                 self.metrics = {}
@@ -151,7 +155,7 @@ def run_epoch(
     mode: str,
     time_keeper: TimeKeeper,
     logger: Callable,
-    key: Array,
+    prng_key: Array,
 ):
     mode = mode.lower()
     # pbar = tqdm.tqdm(enumerate(dataloader), total=config.train.max_steps)
@@ -184,6 +188,10 @@ def run_epoch(
     time_keeper.mark(start_events=["dataloader", "iteration", "tokens", "samples"])
     start_iter = np.array(train_state.iteration)
     it = -1
+    summary_metrics = {
+        "loss" : None,
+        "accuracy": None
+    }
     while True:
         try:
             idt, batch = next(dataloader)
@@ -197,8 +205,8 @@ def run_epoch(
         it += 1
         batch = util.pytorch_to_np(batch)
         time_keeper.mark(end_events={"dataloader": 1}, start_events=["train_step"])
-        to_use, key = jr.split(key)
-        loss, log_data, train_state = step_fn_jit(train_state, batch, key=key)
+        to_use, prng_key = jr.split(prng_key)
+        loss, log_data, train_state = step_fn_jit(train_state, batch, prng_key=to_use)
 
 
         time_keeper.mark(
@@ -218,7 +226,7 @@ def run_epoch(
 
         pbar_desc = ", ".join(
             [f"{mode} epoch: {train_state.epoch}"]
-            + [f"{k}: {v}" for k, v in log_data.items()]
+            + [f"{k}: {v:.2f}" for k, v in log_data.items()]
             + [f"total_iter: {train_state.iteration}"]
         )
         pbar.set_description(pbar_desc)
@@ -260,6 +268,13 @@ def run_epoch(
                 throughput["throughput/tokens_per_sec"] = 1.0 / durations["tokens"]
             log_data.update(throughput)
 
+        for key in summary_metrics:
+            if key in log_data:
+                if summary_metrics[key] is None:
+                    summary_metrics[key] = 0
+                summary_metrics[key] += log_data[key]
+                log_data["running_average/"+key] = summary_metrics[key]/(it + 1)
+
         #### Add mode tag to current metrics ####
         log_data = {f"{mode}/{k}": v for k, v in log_data.items()}
 
@@ -277,7 +292,8 @@ def run_epoch(
             break
 
 
-    return train_state, key, exhausted_loader
+    logger.commit(force=True)            
+    return train_state, prng_key, exhausted_loader
 
 
 
@@ -322,7 +338,7 @@ def train(config: DictConfig) -> None:
         epoch=jnp.array(0),
     )
 
-    key = jr.PRNGKey(0)
+    prng_key = jr.PRNGKey(0)
 
     time_keeper = TimeKeeper()
 
@@ -343,7 +359,7 @@ def train(config: DictConfig) -> None:
 
     while True:
         # train...
-        train_state, key, exhausted_loader = run_epoch(
+        train_state, prng_key, exhausted_loader = run_epoch(
             train_state,
             train_loader,
             train_pbar,
@@ -353,7 +369,7 @@ def train(config: DictConfig) -> None:
             stop_time=valid_freq,
             logger=limited_log,
             time_keeper=time_keeper,
-            key=key,
+            prng_key=prng_key,
         )
         if exhausted_loader:
             train_state = eqx.tree_at(
@@ -368,7 +384,7 @@ def train(config: DictConfig) -> None:
         if valid_freq.elapsed_and_reset(train_state.epoch, train_state.iteration):
             if config.train.valid_key is not None:
                 valid_duration.reset(train_state.epoch, train_state.iteration)
-                train_state, key, exhausted_loader = run_epoch(
+                train_state, prng_key, exhausted_loader = run_epoch(
                     train_state,
                     valid_loader,
                     valid_pbar,
@@ -378,7 +394,7 @@ def train(config: DictConfig) -> None:
                     config=config,
                     logger=limited_log,
                     time_keeper=time_keeper,
-                    key=key,
+                    prng_key=prng_key,
                 )
                 if exhausted_loader:
                     valid_pbar = tqdm.tqdm(
