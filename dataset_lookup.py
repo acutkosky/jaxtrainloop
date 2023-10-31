@@ -82,6 +82,15 @@ def load_cifar_data(config: DictConfig):
 DATASET_REGISTRY["cifar10"] = load_cifar_data
 
 
+def normalize_labels(labels):
+    """
+    make the set of possible labels be consecutive integers
+    starting with 0.
+    """
+    values, indices = np.unique(labels, return_inverse=True)
+    values = np.arange(len(values), dtype=np.int32)
+    return values[indices]
+
 def load_libsvm_data(config: DictConfig):
 
 
@@ -90,16 +99,11 @@ def load_libsvm_data(config: DictConfig):
 
     dataset_id = LIBSVM_TO_OPENML[config.train.dataset]
 
-    print("about to load")
-
     dataset = openml.datasets.get_dataset(dataset_id=dataset_id)
-    print("opened")
     dataset = dataset.get_data()[0].to_numpy()
-    print("numpyed")
     key = jax.random.PRNGKey(123)
 
     np.random.shuffle(dataset)
-    print("shuffled")
 
     # dataset = np.random.shuffle(dataset.get_data()[0].to_numpy())
 
@@ -108,7 +112,7 @@ def load_libsvm_data(config: DictConfig):
     features = torch.tensor(features)
     
     labels = dataset[:,-1].astype(np.int32)
-    labels = labels + np.min(labels)
+    labels = normalize_labels(labels)
     num_classes = np.max(labels) + 1
     labels = torch.tensor(labels)
 
@@ -132,8 +136,8 @@ def load_libsvm_data(config: DictConfig):
     validloader = torch.utils.data.DataLoader(
         validset, batch_size=config.train.batch_size, shuffle=True, num_workers=config.train.dataloader_workers
     )
-    print("loaded dataset")
-    return {'train': trainloader, 'validation': validloader, 'feature_dim': feature_dim, 'num_classes': num_classes}
+    result = {'train': trainloader, 'validation': validloader, 'feature_dim': feature_dim, 'num_classes': num_classes}
+    return result
     
 LIBSVM_TO_OPENML = {
     'aloi': 42396,

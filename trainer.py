@@ -30,6 +30,7 @@ from dataset_lookup import get_loader
 from model_lookup import get_model
 from optimizer_lookup import get_optimizer
 import losses
+import gc
 
 
 class TrainState(NamedTuple):
@@ -117,12 +118,11 @@ def train_step(
         epoch=train_state.epoch,
     )
 
-    if config.log_norms:
-        log_data["norms/grads"] = tree_norm(grads)
-        log_data["norms/params"] = tree_norm(model)
+    # if config.log_norms:
+    #     log_data["norms/grads"] = tree_norm(grads)
+    #     log_data["norms/params"] = tree_norm(model)
 
     return loss, log_data, new_train_state
-
 
 
 class RateLimitedWandbLog:
@@ -165,7 +165,7 @@ def run_epoch(
     if mode == "train":
         step_fn_jit = eqx.filter_jit(
             jtu.Partial(train_step, loss_fn=loss_fn, config=config.train),
-            donate='all',
+            donate="all",
         )
         train_state = eqx.tree_at(
             lambda t: t.model,
@@ -175,7 +175,7 @@ def run_epoch(
     else:
         step_fn_jit = eqx.filter_jit(
             jtu.Partial(inference_step, loss_fn=loss_fn, config=config.train),
-            donate='all',
+            donate="all",
         )
         train_state = eqx.tree_at(
             lambda t: t.model,
@@ -188,10 +188,7 @@ def run_epoch(
     time_keeper.mark(start_events=["dataloader", "iteration", "tokens", "samples"])
     start_iter = np.array(train_state.iteration)
     it = -1
-    summary_metrics = {
-        "loss" : None,
-        "accuracy": None
-    }
+    summary_metrics = {"loss": None, "accuracy": None}
     while True:
         try:
             idt, batch = next(dataloader)
@@ -203,11 +200,12 @@ def run_epoch(
             tokens = None
         # for batch in dataloader:
         it += 1
+        if it % 10 == 0:
+            jax.profiler.save_device_memory_profile(f"profile/memory_{it}.prof")
         batch = util.pytorch_to_np(batch)
         time_keeper.mark(end_events={"dataloader": 1}, start_events=["train_step"])
         to_use, prng_key = jr.split(prng_key)
         loss, log_data, train_state = step_fn_jit(train_state, batch, prng_key=to_use)
-
 
         time_keeper.mark(
             end_events={"train_step": 1},
@@ -248,9 +246,9 @@ def run_epoch(
         )
 
         if train_state.dynamic_scaler_state is not None:
-            log_data.update({
-                f"dynamic_scaler": np.array(train_state.dynamic_scaler_state.scaler)
-            })
+            log_data.update(
+                {f"dynamic_scaler": np.array(train_state.dynamic_scaler_state.scaler)}
+            )
         log_data.update(
             {
                 f"time/fraction_spent/{k}": proportions[k]
@@ -273,7 +271,7 @@ def run_epoch(
                 if summary_metrics[key] is None:
                     summary_metrics[key] = 0
                 summary_metrics[key] += log_data[key]
-                log_data["running_average/"+key] = summary_metrics[key]/(it + 1)
+                log_data["running_average/" + key] = summary_metrics[key] / (it + 1)
 
         #### Add mode tag to current metrics ####
         log_data = {f"{mode}/{k}": v for k, v in log_data.items()}
@@ -291,10 +289,9 @@ def run_epoch(
             exhausted_loader = False
             break
 
-
-    logger.commit(force=True)            
+    if config.train.wandb_project is not None:
+        logger.commit(force=True)
     return train_state, prng_key, exhausted_loader
-
 
 
 @hydra.main(version_base=None, config_path="conf", config_name="config_gpt2")
@@ -351,7 +348,6 @@ def train(config: DictConfig) -> None:
     if config.train.valid_key is not None:
         valid_pbar = tqdm.tqdm(enumerate(data_loaders[config.train.valid_key]))
         valid_loader = iter(valid_pbar)
-
 
     total_duration.reset()
     valid_duration.reset()

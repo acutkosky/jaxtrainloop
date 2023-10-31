@@ -3,11 +3,26 @@ import jax
 import optax
 from jax import tree_util as jtu
 from jax import numpy as jnp
+from jaxtyping import PyTree
 from omegaconf import DictConfig
 from typing import Optional, Any, Callable
 from util import log_optax
 from duration import Duration
 import time
+
+
+def all_finite(tree: PyTree) -> jax.Array:
+    tree = jtu.tree_map(lambda x: jnp.all(jnp.isfinite(x)), tree)
+    leaves = jtu.tree_flatten(tree)[0]
+    return jnp.all(jnp.array(leaves))
+
+
+def zeros_like(tree: PyTree) -> PyTree:
+    return jtu.tree_map(jnp.zeros_like, tree)
+
+
+def zero_if_nan(updates, params):
+    return jax.lax.cond(all_finite(updates), lambda x: x, zeros_like, updates)
 
 
 def schedule_fn(
@@ -35,14 +50,12 @@ def schedule_fn(
     warmup = config.lr_warmup
 
     fraction_remaining = (1 - train_elapsed) / (1 - warmup)
-    if config.lr_decay == 'linear':
+    if config.lr_decay == "linear":
         decay_value = fraction_remaining
-    elif config.lr_decay == 'cosine':
-        decay_value = jnp.cos(fraction_remaining * jnp.pi)*0.5 + 0.5
+    elif config.lr_decay == "cosine":
+        decay_value = jnp.cos(fraction_remaining * jnp.pi) * 0.5 + 0.5
     else:
         decay_value = 1.0
-        
-        
 
     result = peak * jax.lax.select(
         train_elapsed < warmup,
@@ -66,7 +79,7 @@ def get_optimizer(
     if not config.log_callback_data:
         logger = None
     # total_steps = config.max_steps
-    opt_config  = config.optim
+    opt_config = config.optim
     schedule = jtu.Partial(
         schedule_fn,
         loader=train_loader,
@@ -91,7 +104,9 @@ def get_optimizer(
         )
 
     if opt_config.mechanize:
-        optimizer = optax.contrib.mechanize(optimizer, weight_decay=opt_config.mech_lambda)
+        optimizer = optax.contrib.mechanize(
+            optimizer, weight_decay=opt_config.mech_lambda
+        )
         if logger is not None:
 
             def log_fn(updates, state, params):
@@ -109,7 +124,8 @@ def get_optimizer(
         # if not opt_config.mechanize:
         #     optimizer = optax.chain(optimizer, optax.scale(opt_config.lr))
 
-    optimizer = optax.apply_if_finite(optimizer, 15)
+    # optimizer = optax.apply_if_finite(optimizer, 15)
+    optimizer = optax.chain(optimizer, optax.stateless(zero_if_nan))
 
     # we do gradient clipping before anything else
     if opt_config.gradient_clip_val is not None:
