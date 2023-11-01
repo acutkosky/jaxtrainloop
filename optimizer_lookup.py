@@ -8,6 +8,7 @@ from omegaconf import DictConfig
 from typing import Optional, Any, Callable
 from util import log_optax
 from duration import Duration
+from typing import NamedTuple
 import time
 
 
@@ -23,6 +24,39 @@ def zeros_like(tree: PyTree) -> PyTree:
 
 def zero_if_nan(updates, params):
     return jax.lax.cond(all_finite(updates), lambda x: x, zeros_like, updates)
+
+
+class AnytimeAvgState(NamedTuple):
+    iteration: jax.Array
+    momentum: PyTree
+
+def anytime_avg():
+
+    def init_fn(params):
+        state = AnytimeAvgState(
+            iteration = jnp.array([0]),
+            momentum = jtu.tree_map(jnp.zeros_like, params)
+        )
+        return state
+
+    def update_fn(updates, state, params):
+
+        iteration = state.iteration + 1
+        beta = (iteration-1)/(iteration + 1)
+        momentum = jtu.tree_map(
+            lambda m, u: m * beta + u/2 * (1-beta),
+            state.momentum,
+            updates
+        )
+
+        state = AnytimeAvgState(
+            iteration=iteration,
+            momentum=momentum,
+        )
+        return momentum, state
+
+    return optax.GradientTransformation(init_fn, update_fn)
+        
 
 
 def schedule_fn(
@@ -131,6 +165,9 @@ def get_optimizer(
     if opt_config.gradient_clip_val is not None:
         grad_clip = optax.clip_by_global_norm(opt_config.gradient_clip_val)
         optimizer = optax.chain(grad_clip, optimizer)
+
+    if config.averaging == 'anytime':
+        optimizer = optax.chain(optimizer, anytime_avg())
 
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
     return optimizer, opt_state
