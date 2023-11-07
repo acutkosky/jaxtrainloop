@@ -29,7 +29,7 @@ from timekeeper import TimeKeeper
 from dataset_lookup import get_loader
 from model_lookup import get_model
 from optimizer_lookup import get_optimizer
-import losses
+from losses import get_loss
 import gc
 
 
@@ -44,8 +44,7 @@ def apply_model(model: ModelAndState, *args, **kwargs):
     return ModelAndState(module=module, state=state)
     
 class TrainState(NamedTuple):
-    model: eqx.Module
-    model_state: Optional[eqx.nn.State]
+    model: ModelAndState
     opt_state: Any
     optimizer: optax.GradientTransformation
     dynamic_scaler_state: Optional[DynamicScalerState]
@@ -70,13 +69,13 @@ def inference_step(
     prng_key: PRNGKeyArray,
     config: Any,
 ):
-    model = train_state.model
-    model_state = train_state.model_state
+    model = train_state.model.model
+    state = train_state.model.state
 
     # if config.use_amp:
     #     loss_fn = amp(loss_fn, compute_dtype=get_dtype(config.precision))
 
-    loss, (model_state, log_data) = loss_fn(model, model_state, batch, key=prng_key)
+    loss, (state, log_data) = loss_fn(model, state, batch, key=prng_key)
 
     return loss, log_data, train_state
 
@@ -111,8 +110,9 @@ def train_step(
     prng_key: PRNGKeyArray,
     config: Any,
 ):
-    model = train_state.model
-    model_state = train_state.model_state
+    print("compiling train step!")
+    model = train_state.model.model
+    state = train_state.model.state
     opt_state = train_state.opt_state
     dynamic_scaler_state = train_state.dynamic_scaler_state
     optimizer = train_state.optimizer
@@ -126,19 +126,19 @@ def train_step(
             loss_fn, filter=True, has_aux=True, redo_on_nan=0
         )
         dynamic_scaler_state, (
-            (loss, (model_state, log_data)),
+            (loss, (state, log_data)),
             grads,
         ) = value_and_grad_fn(
             model,
-            model_state,
+            state,
             batch,
             key=prng_key,
             dynamic_scaler_state=dynamic_scaler_state,
         )
     else:
         value_and_grad_fn = eqx.filter_value_and_grad(loss_fn, has_aux=True)
-        (loss, (model_state, log_data)), grads = value_and_grad_fn(
-            model, model_state, batch, key=prng_key
+        (loss, (state, log_data)), grads = value_and_grad_fn(
+            model, state, batch, key=prng_key
         )
     updates, opt_state = optimizer.update(
         grads, opt_state, eqx.filter(model, eqx.is_array)
@@ -148,12 +148,11 @@ def train_step(
     iteration = iteration + 1
     epoch = epoch
     if config.averaging == 'polyak':
-        aux = update_average(model, model_state, aux, iteration)
+        aux = update_average(model, state, aux, iteration)
 
 
     new_train_state = TrainState(
-        model=model,
-        model_state=model_state,
+        model=ModelAndState(model=model, state=state),
         opt_state=opt_state,
         dynamic_scaler_state=dynamic_scaler_state,
         optimizer=optimizer,
@@ -162,9 +161,9 @@ def train_step(
         aux=aux,
     )
 
-    # if config.log_norms:
-    #     log_data["norms/grads"] = tree_norm(grads)
-    #     log_data["norms/params"] = tree_norm(model)
+    if config.log_norms:
+        log_data["norms/grads"] = tree_norm(grads)
+        log_data["norms/params"] = tree_norm(model)
 
     return loss, log_data, new_train_state
 
@@ -189,36 +188,43 @@ class RateLimitedWandbLog:
                 self.metrics = {}
 
 def train_prepare(train_state, config):
+    # return train_state
     return eqx.tree_at(
-        lambda t: t.model,
+        lambda t: t.model.model,
         train_state,
-        eqx.nn.inference_mode(train_state.model, value=False),
+        eqx.nn.inference_mode(train_state.model.model, value=False),
     )
 
 def train_break(train_state, config):
     return train_state
     
 def valid_prepare(train_state, config):
+    # return train_state
     train_state = eqx.tree_at(
-        lambda t: t.model,
+        lambda t: t.model.model,
         train_state,
-        eqx.nn.inference_mode(train_state.model, value=True),
+        eqx.nn.inference_mode(train_state.model.model, value=True),
     )
     aux = train_state.aux
+    model = train_state.model
     if config.train.averaging == 'polyak':
+        print("switching!")
         train_state = eqx.tree_at(
-            lambda t: (t.model, t.model_state, t.aux),
+            lambda t: (t.model, t.aux),
             train_state,
-            replace = (aux.model, aux.state, ModelAndState(model=train_state.model, state=train_state.model_state))
+            replace = (aux, model)
         )
     return train_state
+
 def valid_break(train_state, config):
     aux = train_state.aux
+    model = train_state.model
     if config.train.averaging == 'polyak':
+        print("switching back!")
         train_state = eqx.tree_at(
-            lambda t: (t.model, t.model_state, t.aux),
+            lambda t: (t.model, t.aux),
             train_state,
-            replace = (aux.model, aux.state, ModelAndState(model=train_state.model, state=train_state.model_state))
+            replace = (aux, model)
         )
 
     return train_state
@@ -269,15 +275,20 @@ def run_epoch(
             idt, batch = next(dataloader)
         except StopIteration:
             break
-        if "attention_mask" in batch:
-            tokens = util.count_tokens(batch["attention_mask"])
-        else:
-            tokens = None
-        # for batch in dataloader:
         it += 1
-        if it % 10 == 0:
-            jax.profiler.save_device_memory_profile(f"profile/memory_{it}.prof")
         batch = util.pytorch_to_np(batch)
+
+        # bit of a hack:  some data type (like lists of numpy arrays)
+        # will get made here, so we  just skip it.
+        # tricky: we need to count the tokens BEFORE sending  to the step_fn
+        # because we are going to donate all the buffers.
+        try:
+            if "attention_mask" in batch:
+                tokens = util.count_tokens(batch["attention_mask"])
+            else:
+                tokens = None
+        except ValueError:
+            tokens = None
         time_keeper.mark(end_events={"dataloader": 1}, start_events=["train_step"])
         to_use, prng_key = jr.split(prng_key)
         loss, log_data, train_state = step_fn_jit(train_state, batch, prng_key=to_use)
@@ -298,9 +309,9 @@ def run_epoch(
         log_data["loss"] = loss
 
         pbar_desc = ", ".join(
-            [f"{mode} epoch: {train_state.epoch}"]
+            [f"{mode} ep: {train_state.epoch}"]
             + [f"{k}: {v:.2f}" for k, v in log_data.items()]
-            + [f"total_iter: {train_state.iteration}"]
+            + [f"total_it: {train_state.iteration}"]
         )
         pbar.set_description(pbar_desc)
 
@@ -322,7 +333,10 @@ def run_epoch(
 
         if train_state.dynamic_scaler_state is not None:
             log_data.update(
-                {f"dynamic_scaler": np.array(train_state.dynamic_scaler_state.scaler)}
+                {
+                    f"dynamic_scaler/scaler": np.array(train_state.dynamic_scaler_state.scaler),
+                    f"dynamic_scaler/total_resets": np.array(train_state.dynamic_scaler_state.total_resets),
+                }
             )
         log_data.update(
             {
@@ -365,6 +379,12 @@ def run_epoch(
             break
 
     if config.train.wandb_project is not None:
+        if exhausted_loader:
+            for key in summary_metrics:
+                if key in log_data:
+                    if summary_metrics[key] is None:
+                        summary_metrics[key] = 0
+                    log_data["epoch_average/" + key] = summary_metrics[key] / (it + 1)
         logger.commit(force=True)
 
     train_state = break_fn(train_state, config)
@@ -382,9 +402,6 @@ def train(config: DictConfig) -> None:
 
     data_loaders = get_loader(config)
 
-    tokenizer = transformers.GPT2TokenizerFast.from_pretrained("gpt2")
-    tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
-
     if config.train.wandb_project is not None:
         limited_log = RateLimitedWandbLog(config.train.wandb_logs_per_sec)
         wandb.init(project=config.train.wandb_project)
@@ -392,25 +409,25 @@ def train(config: DictConfig) -> None:
     else:
         limited_log = None
 
-    model, model_state = get_model(config, data_loaders)
+    model, state = get_model(config, data_loaders)
+    
 
     optimizer, opt_state = get_optimizer(
         config.train, model, total_duration, data_loaders["train"], limited_log
     )
 
     if config.train.use_amp:
-        dynamic_scaler_state = DynamicScalerState()
+        dynamic_scaler_state = DynamicScalerState(scaler=jnp.array(2**10, dtype=jnp.float32))
     else:
         dynamic_scaler_state = None
 
     if config.train.averaging is not None and config.train.averaging != 'none':
-        aux = copy_arrays(ModelAndState(model=model, state=model_state))
+        aux = copy_arrays(ModelAndState(model=model, state=state))
     else:
         aux = None
 
     train_state = TrainState(
-        model=model,
-        model_state=model_state,
+        model=ModelAndState(model=model, state=state),
         opt_state=opt_state,
         optimizer=optimizer,
         dynamic_scaler_state=dynamic_scaler_state,
@@ -423,7 +440,7 @@ def train(config: DictConfig) -> None:
 
     time_keeper = TimeKeeper()
 
-    loss_fn = losses.LOSS_FN_REGISTRY[config.train.loss_fn]
+    loss_fn = get_loss(config)
     if config.train.use_amp:
         loss_fn = amp(loss_fn, compute_dtype=get_dtype(config.train.precision))
 
@@ -439,7 +456,7 @@ def train(config: DictConfig) -> None:
 
     while True:
         # train...
-        train_state, prng_key, exhausted_loader = run_epoch(
+        train_state, prng_key, exhausted_train_loader = run_epoch(
             train_state,
             train_loader,
             train_pbar,
@@ -451,20 +468,11 @@ def train(config: DictConfig) -> None:
             time_keeper=time_keeper,
             prng_key=prng_key,
         )
-        if exhausted_loader:
-            train_state = eqx.tree_at(
-                lambda t: t.epoch, train_state, train_state.epoch + 1
-            )
-            train_pbar = tqdm.tqdm(enumerate(data_loaders["train"]))
-            train_loader = iter(train_pbar)
-        else:
-            # make a newline so that the progress bar has a new line too...
-            print("\n")
 
         if valid_freq.elapsed_and_reset(train_state.epoch, train_state.iteration):
             if config.train.valid_key is not None:
                 valid_duration.reset(train_state.epoch, train_state.iteration)
-                train_state, prng_key, exhausted_loader = run_epoch(
+                train_state, prng_key, exhausted_valid_loader = run_epoch(
                     train_state,
                     valid_loader,
                     valid_pbar,
@@ -476,11 +484,24 @@ def train(config: DictConfig) -> None:
                     time_keeper=time_keeper,
                     prng_key=prng_key,
                 )
-                if exhausted_loader:
+                if exhausted_valid_loader:
                     valid_pbar = tqdm.tqdm(
                         enumerate(data_loaders[config.train.valid_key])
                     )
                     valid_loader = iter(valid_pbar)
+
+        # tricky: we do this reset *after* the validation loop in order to
+        # postpone incrementing the epoch count until we've logged all the
+        # validation data.
+        if exhausted_train_loader:
+            train_state = eqx.tree_at(
+                lambda t: t.epoch, train_state, train_state.epoch + 1
+            )
+            train_pbar = tqdm.tqdm(enumerate(data_loaders["train"]))
+            train_loader = iter(train_pbar)
+        else:
+            # make a newline so that the progress bar has a new line too...
+            print("\n")
         if total_duration.elapsed(train_state.epoch, train_state.iteration):
             break
 

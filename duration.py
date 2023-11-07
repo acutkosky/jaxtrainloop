@@ -2,16 +2,15 @@ import time
 import numpy as np
 import equinox as eqx
 
+
 def safe(x):
     if eqx.is_array(x):
         return np.array(x)
     return x
 
-    
 
 class Time:
     def __init__(self, *spec_string, **spec_dict):
-
         # TODO: write this with regular expressions or something
         # else less stupid
         self.unit_to_value = dict(spec_dict)
@@ -31,7 +30,6 @@ class Time:
         if len(self.unit_to_value) > len(other.unit_to_value):
             raise ValueError("comparable Time objects must have same units!")
 
-      
         for u in self.unit_to_value:
             if u not in other.unit_to_value:
                 raise ValueError("comparable Time objects must have the same units!")
@@ -42,15 +40,17 @@ class Time:
         return result
 
     def __ge__(self, other):
-        return self._comparison(other, lambda x,y: x >= y)
+        return self._comparison(other, lambda x, y: x >= y)
+
     def __le__(self, other):
         return other >= self
 
     def __gt__(self, other):
-        return self._comparison(other, lambda x,y: x > y)
+        return self._comparison(other, lambda x, y: x > y)
+
     def __lt__(self, other):
         return other > self
-    
+
 
 class Duration:
     def __init__(self, *specs):
@@ -59,17 +59,18 @@ class Duration:
     @property
     def minutes(self):
         return min([d.minutes for d in self.durations])
-    
+
     @property
     def epochs(self):
         return min([d.epochs for d in self.durations])
+
     @property
     def iterations(self):
         return min([d.iterations for d in self.durations])
 
     @property
     def start_time(self):
-        end_time = float('inf')
+        end_time = float("inf")
         start_time = 0.0
         for d in self.durations:
             cur_end = d.start_time + d.minutes
@@ -80,7 +81,7 @@ class Duration:
 
     @property
     def start_epochs(self):
-        end_epochs = float('inf')
+        end_epochs = float("inf")
         start_time = 0.0
         for d in self.durations:
             cur_end = d.start_epochs + d.epochs
@@ -91,7 +92,7 @@ class Duration:
 
     @property
     def start_iterations(self):
-        end_iterations = float('inf')
+        end_iterations = float("inf")
         start_time = 0.0
         for d in self.durations:
             cur_end = d.start_iterations + d.iterations
@@ -121,7 +122,6 @@ class Duration:
         return f"{[str(d) for d in self.durations]}"
 
 
-
 class _Duration:
     def __init__(self, spec):
         if isinstance(spec, Duration):
@@ -132,6 +132,8 @@ class _Duration:
             self.start_iterations = spec.start_iterations
             self.start_time = spec.start_time
             return
+        if spec is None:
+            spec = ""
 
         self.epochs = float("inf")
         self.iterations = float("inf")

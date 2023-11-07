@@ -22,6 +22,8 @@ precision: float16
 
 log_norms: True
 
+averaging: none
+
 wandb_project: null
 wandb_logs_per_sec: 1.0
 

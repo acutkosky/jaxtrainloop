@@ -151,6 +151,25 @@ LIBSVM_TO_OPENML = {
     'Australian': 40981,
     'rcv1_binary': 1577,
     'ijcnn1': 1575,
+    'vowel': 1016,
+    'glass': 1005,
 }
 for name in LIBSVM_TO_OPENML:
     DATASET_REGISTRY[name] = load_libsvm_data
+
+
+def load_constant(config: DictConfig):
+
+    dim = config.train.dimension
+
+    distance = config.train.starting_distance
+
+    target = np.ones((1,dim)) / np.sqrt(dim) * distance
+
+    train_loader = torch.utils.data.TensorDataset(torch.tensor(target))
+
+    result = {'train': train_loader}
+
+    return result
+
+DATASET_REGISTRY["constant"] = load_constant

@@ -153,7 +153,6 @@ class StandardBatchNorm(StatefulLayer):
                 return mean, var
 
             first_time = state.get(self.first_time_index)
-            state = state.set(self.first_time_index, jnp.array(False))
 
             mean, var = jax.vmap(_stats)(x)
             running_mean, running_var = state.get(self.state_index)
@@ -162,6 +161,7 @@ class StandardBatchNorm(StatefulLayer):
             running_var = (1 - momentum) * var + momentum * running_var
             running_mean = lax.select(first_time, mean, running_mean)
             running_var = lax.select(first_time, var, running_var)
+            state = state.set(self.first_time_index, jnp.array(False))
             state = state.set(self.state_index, (running_mean, running_var))
 
         def _norm(y, m, v, w, b):

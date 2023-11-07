@@ -1,12 +1,12 @@
 import jax
 from jax import numpy as jnp
 import equinox as eqx
-from typing import Tuple, Dict
+from typing import Tuple, Dict, Callable
 from jaxtyping import Array
 from jax import tree_util as jtu
 import util
 import equinox as eqx
-
+from omegaconf import DictConfig, OmegaConf
 
 def get_accuracy(
     scores: Array,
@@ -41,12 +41,19 @@ def get_accuracy(
 
 
 @jtu.Partial
-def mean_squared_loss_fn(
-    model: eqx.Module, state: eqx.nn.State, batch: Dict[str, Array], *, key: Array
+def regression_loss_fn(
+    model: eqx.Module,
+    state: eqx.nn.State,
+    batch: Dict[str, Array],
+    error_fn: Callable[Array,Array],
+    target_key="target",
+    input_key="input",
+    *,
+    key: Array,
 ):
     def single_example_loss_fn(input, target, state):
         predictions, state = model(input, state=state, key=key)
-        loss = jnp.mean((predictions - target) ** 2)
+        loss = error_fn(predictions, target)
 
         return loss, predictions, state
 
@@ -56,8 +63,8 @@ def mean_squared_loss_fn(
         out_axes=(0, 0, None),
         axis_name="batch",
     )
-    input = batch["input"]
-    target = batch["target"]
+    input = batch[input_key]
+    target = batch[target_key]
     loss, predictions, state = vmapped_loss_fn(input, target, state)
     loss = jnp.mean(loss)
     log_data = {"samples": target.shape[0]}
@@ -96,10 +103,23 @@ def classification_loss_fn(
         "samples": target.shape[0],
     }
 
-    return loss, (state, log_data)
+    return loss, (new_state, log_data)
 
-LOSS_FN_REGISTRY={}
+
+LOSS_FN_REGISTRY = {}
 LOSS_FN_REGISTRY["lm_classification"] = jtu.Partial(classification_loss_fn)
-LOSS_FN_REGISTRY["tuple_classification"] = jtu.Partial(classification_loss_fn, input_key=0, target_key=1)
-LOSS_FN_REGISTRY["mean_squared_loss"] = mean_squared_loss_fn
+LOSS_FN_REGISTRY["tuple_classification"] = jtu.Partial(
+    classification_loss_fn, input_key=0, target_key=1
+)
+LOSS_FN_REGISTRY["mean_squared_loss"] = jtu.Partial(regression_loss_fn, error_fn=lambda p,y: jnp.mean((p-y)**2))
+LOSS_FN_REGISTRY["mean_abs_loss"] = jtu.Partial(regression_loss_fn, error_fn=lambda p,y: jnp.mean(jnp.abs(p-y)))
+LOSS_FN_REGISTRY["mean_norm_loss"] = jtu.Partial(regression_loss_fn, error_fn=lambda p,y: jnp.sqrt(jnp.sum((p-y)**2)))
 
+def get_loss(config: DictConfig):
+    loss_fn = LOSS_FN_REGISTRY[config.train.loss_fn]
+
+    if config.train.get("loss_fn_args", None):
+        print("container: ")
+        print(OmegaConf.to_container(config.train.loss_fn_args))
+        loss_fn = jtu.Partial(loss_fn, **OmegaConf.to_container(config.train.loss_fn_args))
+    return loss_fn

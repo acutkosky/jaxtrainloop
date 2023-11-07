@@ -8,21 +8,31 @@ from jax import Array
 from typing import Any
 import functools
 import torch
+import logstate
+
+
+def key_tree(key, tree):
+    leaves, treedef = jtu.tree_flatten(tree)
+    key_leaves = jax.random.split(key, len(leaves))
+    return jtu.tree_unflatten(treedef, key_leaves)
+
 
 def count_tokens(input_ids: Array, ignore_index=0):
     return jnp.sum(input_ids != ignore_index)
 
+
 def pytorch_to_np(batch):
     return jtu.tree_map(lambda x: x.numpy(), batch)
 
+
 def reduce_state(state, new_state, reduce_fn=lambda x: jnp.mean(x, axis=0)):
-    '''
+    """
     if a new axis as been added to state via vmap, reduce it back out
-    '''
+    """
     return jtu.tree_map(
         lambda s, n_s: n_s if len(s.shape) == len(n_s.shape) else reduce_fn(n_s),
         state,
-        new_state
+        new_state,
     )
 
 
@@ -33,6 +43,7 @@ def tree_norm(tree):
             jtu.tree_map(lambda x: jnp.sum(x * x), eqx.filter(tree, eqx.is_array)),
         )
     )
+
 
 # TODO: This is hella slow. Needs better solution
 def log_optax(base_optimizer, log_fn):
@@ -47,6 +58,7 @@ def log_optax(base_optimizer, log_fn):
 
 
 # basically the same as the pytorch function cross_entropy
+@jax.named_scope("softmax_cross_entropy")
 def softmax_cross_entropy(
     input,
     target,

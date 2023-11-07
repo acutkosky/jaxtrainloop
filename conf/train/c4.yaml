@@ -2,9 +2,9 @@
 defaults:
   - optim: adamw
 
-total_duration: "12hr"
-valid_frequency: "1hr"
-valid_duration: "5min"
+total_duration: "3hr"
+valid_frequency: "30min"
+valid_duration: "2min"
 
 dataset: "c4"
 data_path: "/projectnb/aclab/datasets/c4/en/"
@@ -25,6 +25,8 @@ wandb_project: null
 wandb_logs_per_sec: 1.0
 
 log_norms: True
+
+averaging: none
 
 # this will slow down computation a bit (I believe due to extra GPU/CPU communication),
 # but will log more stuff (like learning rates).

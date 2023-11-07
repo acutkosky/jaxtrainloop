@@ -6,10 +6,36 @@ from jax import numpy as jnp
 from jaxtyping import PyTree
 from omegaconf import DictConfig
 from typing import Optional, Any, Callable
-from util import log_optax
+from util import log_optax, key_tree
 from duration import Duration
 from typing import NamedTuple
 import time
+import mechanic as new_mechanic
+
+
+class NoiseState(NamedTuple):
+    key: jax.Array
+
+
+def add_noise(sigma: float, key: jax.Array):
+    def init_fn(params):
+        state = NoiseState(key)
+        return state
+
+    def update_fn(updates, state, params):
+        to_use, key = jax.random.split(state.key)
+        state = NoiseState(key)
+
+        to_use = key_tree(to_use, updates)
+        updates = jtu.tree_map(
+            lambda u_i, k_i: u_i + sigma * jax.random.normal(k_i, u_i.shape, u_i.dtype),
+            updates,
+            to_use,
+        )
+
+        return updates, state
+
+    return optax.GradientTransformation(init_fn, update_fn)
 
 
 def all_finite(tree: PyTree) -> jax.Array:
@@ -18,6 +44,20 @@ def all_finite(tree: PyTree) -> jax.Array:
     return jnp.all(jnp.array(leaves))
 
 
+def skip_nonfinite(opt: optax.GradientTransformation) -> optax.GradientTransformation:
+
+    def init_fn(params: optax.Params):
+        return opt.init(params)
+
+    def update_fn(updates: optax.Updates, state: optax.OptState, params: Optional[optax.Params]=None):
+        next_updates, next_state = opt.update(updates, state, params)
+        return jax.lax.cond(
+            all_finite((next_updates, next_state)),
+            lambda : (next_updates, next_state),
+            lambda : (zeros_like(updates), state)
+        )
+    return optax.GradientTransformation(init_fn, update_fn)
+        
 def zeros_like(tree: PyTree) -> PyTree:
     return jtu.tree_map(jnp.zeros_like, tree)
 
@@ -30,23 +70,19 @@ class AnytimeAvgState(NamedTuple):
     iteration: jax.Array
     momentum: PyTree
 
-def anytime_avg():
 
+def anytime_avg():
     def init_fn(params):
         state = AnytimeAvgState(
-            iteration = jnp.array([0]),
-            momentum = jtu.tree_map(jnp.zeros_like, params)
+            iteration=jnp.array(0), momentum=jtu.tree_map(jnp.zeros_like, params)
         )
         return state
 
     def update_fn(updates, state, params):
-
         iteration = state.iteration + 1
-        beta = (iteration-1)/(iteration + 1)
+        beta = (iteration - 1) / (iteration + 1)
         momentum = jtu.tree_map(
-            lambda m, u: m * beta + u/2 * (1-beta),
-            state.momentum,
-            updates
+            lambda m, u: m * beta + u / 2 * (1 - beta), state.momentum, updates
         )
 
         state = AnytimeAvgState(
@@ -56,7 +92,6 @@ def anytime_avg():
         return momentum, state
 
     return optax.GradientTransformation(init_fn, update_fn)
-        
 
 
 def schedule_fn(
@@ -138,9 +173,16 @@ def get_optimizer(
         )
 
     if opt_config.mechanize:
-        optimizer = optax.contrib.mechanize(
-            optimizer, weight_decay=opt_config.mech_lambda
-        )
+        if opt_config.mechanize == 'optax':
+            optimizer = optax.contrib.mechanize(
+                optimizer, weight_decay=opt_config.mech_lambda
+            )
+        elif opt_config.mechanize == 'new':
+            optimizer = new_mechanic.mechanize(optimizer)
+        elif opt_config.mechanize == 'nobeta':
+            optimizer = new_mechanic.mechanize_no_beta(optimizer)
+        else:
+            raise ValueError(f"unknown mechanize option: {opt_config.mechanize}")
         if logger is not None:
 
             def log_fn(updates, state, params):
@@ -159,15 +201,21 @@ def get_optimizer(
         #     optimizer = optax.chain(optimizer, optax.scale(opt_config.lr))
 
     # optimizer = optax.apply_if_finite(optimizer, 15)
-    optimizer = optax.chain(optimizer, optax.stateless(zero_if_nan))
+    optimizer = skip_nonfinite(optimizer)
+    # optimizer = optax.chain(optimizer, optax.stateless(zero_if_nan))
 
     # we do gradient clipping before anything else
     if opt_config.gradient_clip_val is not None:
         grad_clip = optax.clip_by_global_norm(opt_config.gradient_clip_val)
         optimizer = optax.chain(grad_clip, optimizer)
 
-    if config.averaging == 'anytime':
+    if config.averaging == "anytime":
         optimizer = optax.chain(optimizer, anytime_avg())
 
-    opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
+    if config.get("gradient_noise", 0) != 0:
+        optimizer = optax.chain(
+            add_noise(config.gradient_noise, jax.random.PRNGKey(1231)), optimizer
+        )
+
+    opt_state = optimizer.init(jtu.tree_map(jnp.array, eqx.filter(model, eqx.is_array)))
     return optimizer, opt_state
