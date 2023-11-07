@@ -20,7 +20,7 @@ import ml_dtypes
 import wandb
 from collections import defaultdict
 import time
-from duration import Duration
+from duration import Duration, set_timestamp
 
 import numpy as np
 
@@ -30,19 +30,21 @@ from dataset_lookup import get_loader
 from model_lookup import get_model
 from optimizer_lookup import get_optimizer
 from losses import get_loss
-import gc
+import logstate
 
 
 class ModelAndState(NamedTuple):
     model: eqx.Module
     state: Optional[eqx.nn.State]
 
+
 def apply_model(model: ModelAndState, *args, **kwargs):
     module = model.module
     state = model.state
     state = model.module(*args, state=state, **kwargs)
     return ModelAndState(module=module, state=state)
-    
+
+
 class TrainState(NamedTuple):
     model: ModelAndState
     opt_state: Any
@@ -69,6 +71,8 @@ def inference_step(
     prng_key: PRNGKeyArray,
     config: Any,
 ):
+    if isinstance(train_state, logstate.LoggedState):
+        train_state = train_state.get_state()
     model = train_state.model.model
     state = train_state.model.state
 
@@ -77,31 +81,30 @@ def inference_step(
 
     loss, (state, log_data) = loss_fn(model, state, batch, key=prng_key)
 
-    return loss, log_data, train_state
+    return loss, logstate.LoggedState(train_state, log_data)
 
 
 def update_avg_tree(tree, avg_tree, count):
     array, static = eqx.partition(tree, eqx.is_array)
     avg_array, _ = eqx.partition(avg_tree, eqx.is_array)
 
-    array = jtu.tree_map(
-        lambda a, t: a + (t-a)/count,
-        avg_array,
-        array
-    )
+    array = jtu.tree_map(lambda a, t: a + (t - a) / count, avg_array, array)
 
     return eqx.combine(array, static)
 
 
-def update_average(model: eqx.Module, state: Optional[eqx.nn.State], average: ModelAndState, iteration: jax.Array):
-
+def update_average(
+    model: eqx.Module,
+    state: Optional[eqx.nn.State],
+    average: ModelAndState,
+    iteration: jax.Array,
+):
     model = update_avg_tree(model, average.model, iteration)
     if state is not None:
         state = update_avg_tree(state, average.state, iteration)
 
     return ModelAndState(model=model, state=state)
 
-    
 
 def train_step(
     train_state: TrainState,
@@ -111,12 +114,15 @@ def train_step(
     config: Any,
 ):
     print("compiling train step!")
+
+    if isinstance(train_state, logstate.LoggedState):
+        train_state = train_state.get_state()
     model = train_state.model.model
     state = train_state.model.state
     opt_state = train_state.opt_state
     dynamic_scaler_state = train_state.dynamic_scaler_state
     optimizer = train_state.optimizer
-    aux=train_state.aux
+    aux = train_state.aux
     epoch = train_state.epoch
     iteration = train_state.iteration
 
@@ -147,9 +153,8 @@ def train_step(
 
     iteration = iteration + 1
     epoch = epoch
-    if config.averaging == 'polyak':
+    if config.averaging == "polyak":
         aux = update_average(model, state, aux, iteration)
-
 
     new_train_state = TrainState(
         model=ModelAndState(model=model, state=state),
@@ -165,7 +170,7 @@ def train_step(
         log_data["norms/grads"] = tree_norm(grads)
         log_data["norms/params"] = tree_norm(model)
 
-    return loss, log_data, new_train_state
+    return loss, logstate.LoggedState(new_train_state, log_data)
 
 
 class RateLimitedWandbLog:
@@ -187,6 +192,7 @@ class RateLimitedWandbLog:
                 self.last_time = cur_time
                 self.metrics = {}
 
+
 def train_prepare(train_state, config):
     # return train_state
     return eqx.tree_at(
@@ -195,9 +201,11 @@ def train_prepare(train_state, config):
         eqx.nn.inference_mode(train_state.model.model, value=False),
     )
 
+
 def train_break(train_state, config):
     return train_state
-    
+
+
 def valid_prepare(train_state, config):
     # return train_state
     train_state = eqx.tree_at(
@@ -207,32 +215,31 @@ def valid_prepare(train_state, config):
     )
     aux = train_state.aux
     model = train_state.model
-    if config.train.averaging == 'polyak':
+    if config.train.averaging == "polyak":
         print("switching!")
         train_state = eqx.tree_at(
-            lambda t: (t.model, t.aux),
-            train_state,
-            replace = (aux, model)
+            lambda t: (t.model, t.aux), train_state, replace=(aux, model)
         )
     return train_state
+
 
 def valid_break(train_state, config):
     aux = train_state.aux
     model = train_state.model
-    if config.train.averaging == 'polyak':
+    if config.train.averaging == "polyak":
         print("switching back!")
         train_state = eqx.tree_at(
-            lambda t: (t.model, t.aux),
-            train_state,
-            replace = (aux, model)
+            lambda t: (t.model, t.aux), train_state, replace=(aux, model)
         )
 
     return train_state
+
 
 def copy_arrays(tree):
     array, static = eqx.partition(tree, eqx.is_array)
     array = jtu.tree_map(jnp.array, array)
     return eqx.combine(array, static)
+
 
 def run_epoch(
     train_state: TrainState,
@@ -291,7 +298,10 @@ def run_epoch(
             tokens = None
         time_keeper.mark(end_events={"dataloader": 1}, start_events=["train_step"])
         to_use, prng_key = jr.split(prng_key)
-        loss, log_data, train_state = step_fn_jit(train_state, batch, prng_key=to_use)
+        loss, train_state = step_fn_jit(train_state, batch, prng_key=to_use)
+        log_list = logstate.list_of_logs(train_state)
+        print("log_list: ",log_list)
+        log_data = util.merge_dicts(*logstate.list_of_logs(train_state))
 
         time_keeper.mark(
             end_events={"train_step": 1},
@@ -334,8 +344,12 @@ def run_epoch(
         if train_state.dynamic_scaler_state is not None:
             log_data.update(
                 {
-                    f"dynamic_scaler/scaler": np.array(train_state.dynamic_scaler_state.scaler),
-                    f"dynamic_scaler/total_resets": np.array(train_state.dynamic_scaler_state.total_resets),
+                    f"dynamic_scaler/scaler": np.array(
+                        train_state.dynamic_scaler_state.scaler
+                    ),
+                    f"dynamic_scaler/total_resets": np.array(
+                        train_state.dynamic_scaler_state.total_resets
+                    ),
                 }
             )
         log_data.update(
@@ -385,10 +399,11 @@ def run_epoch(
                     if summary_metrics[key] is None:
                         summary_metrics[key] = 0
                     log_data["epoch_average/" + key] = summary_metrics[key] / (it + 1)
+            logger(log_data)
         logger.commit(force=True)
 
     train_state = break_fn(train_state, config)
-    
+
     return train_state, prng_key, exhausted_loader
 
 
@@ -410,18 +425,19 @@ def train(config: DictConfig) -> None:
         limited_log = None
 
     model, state = get_model(config, data_loaders)
-    
 
     optimizer, opt_state = get_optimizer(
         config.train, model, total_duration, data_loaders["train"], limited_log
     )
 
     if config.train.use_amp:
-        dynamic_scaler_state = DynamicScalerState(scaler=jnp.array(2**10, dtype=jnp.float32))
+        dynamic_scaler_state = DynamicScalerState(
+            scaler=jnp.array(2**10, dtype=jnp.float32)
+        )
     else:
         dynamic_scaler_state = None
 
-    if config.train.averaging is not None and config.train.averaging != 'none':
+    if config.train.averaging is not None and config.train.averaging != "none":
         aux = copy_arrays(ModelAndState(model=model, state=state))
     else:
         aux = None
@@ -469,7 +485,9 @@ def train(config: DictConfig) -> None:
             prng_key=prng_key,
         )
 
-        if valid_freq.elapsed_and_reset(train_state.epoch, train_state.iteration):
+        next_epoch_number = train_state.epoch + exhausted_train_loader
+
+        if valid_freq.elapsed_and_reset(next_epoch_number, train_state.iteration):
             if config.train.valid_key is not None:
                 valid_duration.reset(train_state.epoch, train_state.iteration)
                 train_state, prng_key, exhausted_valid_loader = run_epoch(

@@ -1,12 +1,38 @@
 import time
 import numpy as np
+import jax
+from jax import numpy as jnp
 import equinox as eqx
+from typing import Optional
+from jaxtyping import PyTree
+from jax import tree_util as jtu
 
 
 def safe(x):
     if eqx.is_array(x):
         return np.array(x)
     return x
+
+
+class JaxTimeStamp(eqx.Module):
+    timestamp: jax.Array
+
+    def __init__(self, value: Optional[int] = None):
+        if value is None:
+            value = time.time()
+        self.timestamp = jnp.array(value)
+
+
+def set_timestamp(tree: PyTree, timestamp=None):
+    if timestamp is None:
+        timestamp = time.time()
+
+    def update(node):
+        if isinstance(node, JaxTimeStamp):
+            return JaxTimeStamp(timestamp)
+        return node
+
+    return jtu.tree_map(update, tree, is_leaf=lambda x: isinstance(x, JaxTimeStamp))
 
 
 class Time:

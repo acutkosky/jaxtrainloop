@@ -5,6 +5,7 @@ import optax
 from optax import GradientTransformation
 import equinox as eqx
 from jax import Array
+from jaxtyping import PyTree
 from typing import Any
 import functools
 import torch
@@ -36,6 +37,9 @@ def reduce_state(state, new_state, reduce_fn=lambda x: jnp.mean(x, axis=0)):
     )
 
 
+def zeros_like(tree: PyTree) -> PyTree:
+    return jtu.tree_map(jnp.zeros_like, tree)
+
 def tree_norm(tree):
     return jnp.sqrt(
         jtu.tree_reduce(
@@ -45,14 +49,29 @@ def tree_norm(tree):
     )
 
 
+def merge_dicts(*to_merge):
+    result = {}
+    for d in to_merge:
+        result.update(d)
+    return result
+
+
 # TODO: This is hella slow. Needs better solution
-def log_optax(base_optimizer, log_fn):
+def log_optax(base_optimizer, log_fn, pruned=False):
     def init_fn(params):
-        return base_optimizer.init(params)
+        state = base_optimizer.init(params)
+        if pruned:
+            return state
+        log_data = log_fn(zeros_like(params), state, params)
+        return logstate.LoggedState(state, log_data)
 
     def update_fn(updates, state, params):
-        log_fn(updates, state, params)
-        return base_optimizer.update(updates, state, params)
+        if not pruned:
+            state, log_data = state
+        log_data = log_fn(updates, state, params)
+        updates, state = base_optimizer.update(updates, state, params)
+        state = logstate.LoggedState(state, log_data)
+        return updates, state
 
     return GradientTransformation(init_fn, update_fn)
 

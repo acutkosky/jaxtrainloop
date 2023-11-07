@@ -1,10 +1,13 @@
 defaults:
   - optim: sgd
+  - _self_
 
-optim.gradient_clip_val: null
-optim.lr_decay: null
-optim.lr_warmup: 0.0
-optim.weight_decay: 0.0
+optim:
+  gradient_clip_val: null
+  lr_decay: null
+  lr_warmup: 0.0
+  weight_decay: 0.0
+  momentum: 0.0
 
 total_duration: "10ep"
 valid_frequency: "1ep"
@@ -25,7 +28,7 @@ averaging: 'none'
 batch_size: 32 # number of examples placed on each GPU
 
 # whether to use automatic mixed precision
-use_amp: True
+use_amp: False
 # value to cast to in mixed precision training.
 precision: float16
 

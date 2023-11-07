@@ -6,11 +6,14 @@ from jax import numpy as jnp
 from jaxtyping import PyTree
 from omegaconf import DictConfig
 from typing import Optional, Any, Callable
-from util import log_optax, key_tree
+from util import log_optax, key_tree, zeros_like
 from duration import Duration
 from typing import NamedTuple
 import time
 import mechanic as new_mechanic
+import duration
+import logstate
+
 
 
 class NoiseState(NamedTuple):
@@ -45,21 +48,24 @@ def all_finite(tree: PyTree) -> jax.Array:
 
 
 def skip_nonfinite(opt: optax.GradientTransformation) -> optax.GradientTransformation:
-
     def init_fn(params: optax.Params):
         return opt.init(params)
 
-    def update_fn(updates: optax.Updates, state: optax.OptState, params: Optional[optax.Params]=None):
+    def update_fn(
+        updates: optax.Updates,
+        state: optax.OptState,
+        params: Optional[optax.Params] = None,
+    ):
         next_updates, next_state = opt.update(updates, state, params)
         return jax.lax.cond(
             all_finite((next_updates, next_state)),
-            lambda : (next_updates, next_state),
-            lambda : (zeros_like(updates), state)
+            lambda: (next_updates, next_state),
+            lambda: (zeros_like(updates), state),
         )
+
     return optax.GradientTransformation(init_fn, update_fn)
-        
-def zeros_like(tree: PyTree) -> PyTree:
-    return jtu.tree_map(jnp.zeros_like, tree)
+
+
 
 
 def zero_if_nan(updates, params):
@@ -94,20 +100,37 @@ def anytime_avg():
     return optax.GradientTransformation(init_fn, update_fn)
 
 
+def scale_by_schedule_logged(schedule_fn):
+    def init_fn(self):
+        return logstate.LoggedState((jnp.array(0), duration.JaxTimeStamp()), log_data={"lr/schedule": jnp.array(0.0)})
+
+    def update_fn(updates, state, params):
+        (count, timestamp), log_data = state
+        count = count + 1
+
+        schedule = schedule_fn(count, timestamp)
+        updates = jtu.tree_map(lambda x: schedule * x, updates)
+        log_data = {"lr/schedule": schedule}
+        return updates, logstate.LoggedState(
+            state=(count, timestamp), log_data=log_data
+        )
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
 def schedule_fn(
     count: int,
+    timestamp: duration.JaxTimeStamp,
     config: DictConfig,
     train_duration: Duration,
     loader: Any,
     peak: float,
-    logger: Optional[Callable] = None,
+    # logger: Optional[Callable] = None,
 ):
     if train_duration.minutes != float("inf"):
-        train_elapsed = jax.experimental.io_callback(
-            lambda: jnp.asarray(
-                (time.time() / 60 - train_duration.start_time) / train_duration.minutes
-            ),
-            jnp.asarray(1.0),
+        train_elapsed = jnp.asarray(
+            (timestamp.timestamp / 60 - train_duration.start_time)
+            / train_duration.minutes
         )
     else:
         if train_duration.iterations != float("inf"):
@@ -131,10 +154,10 @@ def schedule_fn(
         train_elapsed / warmup,
         decay_value,
     )
-    if logger is not None:
-        jax.experimental.io_callback(
-            logger, None, {"lr/schedule": result}, commit=False
-        )
+    # if logger is not None:
+    #     jax.experimental.io_callback(
+    #         logger, None, {"lr/schedule": result}, commit=False
+    #     )
     return result
 
 
@@ -155,40 +178,37 @@ def get_optimizer(
         train_duration=train_duration,
         config=opt_config,
         peak=opt_config.lr,
-        logger=logger,
+        # logger=logger,
     )
-    if opt_config.bake_schedule:
-        base_schedule = schedule
-    else:
-        base_schedule = 1.0
 
+    # set the learning rate to 1.0 here - we will scale
+    # by the learning rate schedule later.
     if opt_config.name == "sgd":
         optimizer = optax.chain(
             optax.add_decayed_weights(opt_config.weight_decay),
-            optax.sgd(learning_rate=base_schedule, momentum=opt_config.momentum),
+            optax.sgd(learning_rate=1.0, momentum=opt_config.momentum),
         )
     elif opt_config.name == "adamw":
-        optimizer = optax.adamw(
-            learning_rate=base_schedule, weight_decay=opt_config.weight_decay
-        )
+        optimizer = optax.adamw(learning_rate=1.0, weight_decay=opt_config.weight_decay)
+
+    if opt_config.bake_schedule:
+        optimizer = optax.chain(optimizer, scale_by_schedule_logged(schedule))
 
     if opt_config.mechanize:
-        if opt_config.mechanize == 'optax':
+        if opt_config.mechanize == "optax":
             optimizer = optax.contrib.mechanize(
                 optimizer, weight_decay=opt_config.mech_lambda
             )
-        elif opt_config.mechanize == 'new':
+        elif opt_config.mechanize == "new":
             optimizer = new_mechanic.mechanize(optimizer)
-        elif opt_config.mechanize == 'nobeta':
+        elif opt_config.mechanize == "nobeta":
             optimizer = new_mechanic.mechanize_no_beta(optimizer)
         else:
             raise ValueError(f"unknown mechanize option: {opt_config.mechanize}")
         if logger is not None:
 
             def log_fn(updates, state, params):
-                jax.experimental.io_callback(
-                    logger, None, {"mechanic/s": jnp.sum(state.s)}, commit=False
-                )
+                return {"mechanic/s": jnp.sum(state.s)}
 
             optimizer = log_optax(optimizer, log_fn)
 
@@ -196,7 +216,7 @@ def get_optimizer(
     #     optimizer = optax.chain(optimizer, optax.scale(opt_config.lr))
 
     if not opt_config.bake_schedule:
-        optimizer = optax.chain(optimizer, optax.scale_by_schedule(schedule))
+        optimizer = optax.chain(optimizer, scale_by_schedule_logged(schedule))
         # if not opt_config.mechanize:
         #     optimizer = optax.chain(optimizer, optax.scale(opt_config.lr))
 
