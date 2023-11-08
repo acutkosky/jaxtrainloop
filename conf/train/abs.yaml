@@ -1,0 +1,56 @@
+defaults:
+  - optim: sgd
+  - _self_
+
+optim:
+  gradient_clip_val: null
+  lr_decay: null
+  lr_warmup: 0.0
+  weight_decay: 0.0
+  momentum: 0.0
+
+total_duration: "100ep"
+valid_frequency: "1ep"
+valid_duration: "1ep"
+
+dataset: constant
+starting_distance: 10
+dimension: 10
+
+valid_key: null
+test_key: "test"
+
+loss_fn: mean_abs_loss
+loss_fn_args:
+  target_key: 0
+  input_key: 0
+
+gradient_noise: 0
+
+averaging: 'none'
+
+
+batch_size: 32 # number of examples placed on each GPU
+
+# whether to use automatic mixed precision
+use_amp: True
+# value to cast to in mixed precision training.
+precision: float16
+
+log_norms: True
+
+wandb_project: null
+wandb_logs_per_sec: 1.0
+
+# this will slow down computation a bit (I believe due to extra GPU/CPU communication),
+# but will log more stuff (like learning rates).
+# Still working on nice way to do this logging - we really should only incur one communication
+# round per iteration and I don't think the logging data should significantly impact it.
+log_callback_data: True
+
+
+dataloader_workers: 2
+  
+
+
+

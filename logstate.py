@@ -20,13 +20,12 @@ class LoggedState(eqx.Module):
 
     def get_state(self):
         return self._state
+
     def get_logs(self):
         return self._log_data
 
     def __getattr__(self, name):
         return getattr(self._state, name)
-
-
 
 
 def map_logs(fn: Callable, tree: PyTree, state_fn: Callable = lambda x: x):

@@ -81,7 +81,9 @@ def inference_step(
 
     loss, (state, log_data) = loss_fn(model, state, batch, key=prng_key)
 
-    return loss, logstate.LoggedState(train_state, log_data)
+    logged_state = logstate.LoggedState(train_state, log_data)
+    all_logs = util.merge_dicts(*logstate.list_of_logs(logged_state))
+    return loss, logged_state, all_logs
 
 
 def update_avg_tree(tree, avg_tree, count):
@@ -113,7 +115,7 @@ def train_step(
     prng_key: PRNGKeyArray,
     config: Any,
 ):
-    print("compiling train step!")
+    print("\ncompiling train step!\n")
 
     if isinstance(train_state, logstate.LoggedState):
         train_state = train_state.get_state()
@@ -170,7 +172,9 @@ def train_step(
         log_data["norms/grads"] = tree_norm(grads)
         log_data["norms/params"] = tree_norm(model)
 
-    return loss, logstate.LoggedState(new_train_state, log_data)
+    logged_state = logstate.LoggedState(new_train_state, log_data)
+    all_logs = util.merge_dicts(*logstate.list_of_logs(logged_state))
+    return loss, logged_state, all_logs
 
 
 class RateLimitedWandbLog:
@@ -298,10 +302,9 @@ def run_epoch(
             tokens = None
         time_keeper.mark(end_events={"dataloader": 1}, start_events=["train_step"])
         to_use, prng_key = jr.split(prng_key)
-        loss, train_state = step_fn_jit(train_state, batch, prng_key=to_use)
-        log_list = logstate.list_of_logs(train_state)
-        print("log_list: ",log_list)
-        log_data = util.merge_dicts(*logstate.list_of_logs(train_state))
+        train_state = set_timestamp(train_state)
+        loss, train_state, log_data = step_fn_jit(train_state, batch, prng_key=to_use)
+        # print("log_list: ",log_list)
 
         time_keeper.mark(
             end_events={"train_step": 1},
@@ -395,10 +398,9 @@ def run_epoch(
     if config.train.wandb_project is not None:
         if exhausted_loader:
             for key in summary_metrics:
-                if key in log_data:
-                    if summary_metrics[key] is None:
-                        summary_metrics[key] = 0
-                    log_data["epoch_average/" + key] = summary_metrics[key] / (it + 1)
+                if summary_metrics[key] is None:
+                    summary_metrics[key] = 0
+                log_data[f"{mode}/epoch_average/{key}"] = summary_metrics[key] / (it + 1)
             logger(log_data)
         logger.commit(force=True)
 
@@ -486,6 +488,8 @@ def train(config: DictConfig) -> None:
         )
 
         next_epoch_number = train_state.epoch + exhausted_train_loader
+        if not exhausted_train_loader:
+            print("\n")
 
         if valid_freq.elapsed_and_reset(next_epoch_number, train_state.iteration):
             if config.train.valid_key is not None:
@@ -517,9 +521,8 @@ def train(config: DictConfig) -> None:
             )
             train_pbar = tqdm.tqdm(enumerate(data_loaders["train"]))
             train_loader = iter(train_pbar)
-        else:
-            # make a newline so that the progress bar has a new line too...
-            print("\n")
+        # make a newline so that the progress bar has a new line too...
+        print("\n")
         if total_duration.elapsed(train_state.epoch, train_state.iteration):
             break
 

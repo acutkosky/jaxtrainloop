@@ -12,6 +12,25 @@ import torch
 import logstate
 
 
+def same_shape_leaf(l1, l2):
+    if eqx.is_array(l1) != eqx.is_array(l2):
+        return False
+    if not eqx.is_array(l1):
+        return l1 == l2
+    if l1.shape != l2.shape:
+        return False
+    if l1.dtype != l2.dtype:
+        return False
+    return True
+
+
+def same_shape_pytree(tree1, tree2):
+    try:
+        return jtu.tree_all(jtu.tree_map(same_shape_leaf, tree1, tree2))
+    except ValueError:
+        return False
+
+
 def key_tree(key, tree):
     leaves, treedef = jtu.tree_flatten(tree)
     key_leaves = jax.random.split(key, len(leaves))
@@ -39,6 +58,7 @@ def reduce_state(state, new_state, reduce_fn=lambda x: jnp.mean(x, axis=0)):
 
 def zeros_like(tree: PyTree) -> PyTree:
     return jtu.tree_map(jnp.zeros_like, tree)
+
 
 def tree_norm(tree):
     return jnp.sqrt(

@@ -170,7 +170,6 @@ def get_optimizer(
 ):
     if not config.log_callback_data:
         logger = None
-    # total_steps = config.max_steps
     opt_config = config.optim
     schedule = jtu.Partial(
         schedule_fn,
@@ -178,7 +177,6 @@ def get_optimizer(
         train_duration=train_duration,
         config=opt_config,
         peak=opt_config.lr,
-        # logger=logger,
     )
 
     # set the learning rate to 1.0 here - we will scale
@@ -212,8 +210,6 @@ def get_optimizer(
 
             optimizer = log_optax(optimizer, log_fn)
 
-    # else:
-    #     optimizer = optax.chain(optimizer, optax.scale(opt_config.lr))
 
     if not opt_config.bake_schedule:
         optimizer = optax.chain(optimizer, scale_by_schedule_logged(schedule))
