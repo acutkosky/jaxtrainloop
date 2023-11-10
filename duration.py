@@ -141,6 +141,13 @@ class Time(eqx.Module):
                 return False
         return True
 
+    def set_epoch(self, value):
+        return Time(epochs=value, iterations=self.iterations, hours=self.hours)
+    def set_iterations(self, value):
+        return Time(epochs=self.epochs, iterations=value, hours=self.hours)
+    def set_hours(self, value):
+        return Time(epochs=self.epochs, iterations=self.iterations, hours=value)
+
     def is_compatible(self, other):
         return len(self) == len(other)
 
@@ -198,7 +205,7 @@ def compatable_now(interval):
 
     now = Time(epochs=start_epochs, hours=start_epochs, iterations=start_iterations)
     return now
-
+ 
 
 class TimeDuration(eqx.Module):
     start_time: Time
@@ -217,7 +224,9 @@ class TimeDuration(eqx.Module):
         self.start_time = start_time
         self.end_time = self.start_time + self.interval
 
-    def reset(self, now):
+    def reset(self, now: Time, overwrite_timestamp: bool=False):
+        if overwrite_timestamp:
+            now = now.set_hours(offset_time())
         start_time = now
         end_time = now + self.interval
         interval = self.interval
@@ -227,6 +236,11 @@ class TimeDuration(eqx.Module):
             self,
             (start_time, end_time, interval),
         )
+
+
+    def elapsed(self, comparison: Time):
+        return comparison > end_time
+        
 
 
 class Duration:

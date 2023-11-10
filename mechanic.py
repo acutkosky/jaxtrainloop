@@ -50,33 +50,43 @@ def mirror_descent_tuner(
         initial_value = state.initial_value
         max_grad  = state.max_grad
 
-        clipped_updates = jtu.tree_map(
-            lambda u_i, s_i: jnp.clip(u_i, -jnp.sqrt(s_i), jnp.sqrt(s_i)),
-            updates,
-            max_grad,
-            # sum_squared_grad,
-        )
+        # clipped_updates = jtu.tree_map(
+        #     lambda u_i, s_i: jnp.clip(u_i, -jnp.sqrt(s_i), jnp.sqrt(s_i)),
+        #     updates,
+        #     # max_grad,
+        #     sum_squared_grad,
+        # )
+        clipped_updates = updates
 
+        # clipped_updates = jtu.tree_map(
+        #     lambda u_i, m_i: jnp.clip(u_i, -m_i, m_i),
+        #     updates,
+        #     max_grad,
+        #     # sum_squared_grad,
+        # )
         next_sum_squared_grad = jtu.tree_map(
-            lambda sum_i, u_i: beta * sum_i + 4 * u_i**2, sum_squared_grad, updates
+            lambda sum_i, u_i: beta**2 * sum_i + u_i**2, sum_squared_grad, updates
         )
         next_max_grad  = jtu.tree_map(
             lambda m_i, u_i: jnp.maximum(beta * m_i, jnp.abs(u_i)),
             max_grad,
             updates
         )
+        
 
-        def link_fn(theta, V, M):
+        def link_fn(theta, V, M, init_i):
             V = V + small_value
             M = M + small_value
             # exponent = jax.lax.cond(jnp.abs(theta) < V/M, lambda: theta**2 /V, lambda : 2*theta/M-V/M**2)
             # return jnp.sign(theta) * epsilon * (jnp.exp(exponent) -1)
             # return jnp.sign(theta) * epsilon * (jnp.exp(theta**2 / V) - 1)
-            return jnp.sign(theta) * epsilon * (jnp.exp(jnp.abs(theta)/jnp.sqrt(V)) - 1)
+            return init_i * jnp.exp(theta/jnp.sqrt(V))
+            # return jnp.sign(theta) * epsilon * (jnp.exp(jnp.abs(theta)/jnp.sqrt(V)) - 1)
 
-        def inv_link_fn(p, V, M):
+        def inv_link_fn(p, V, M, init_i):
             V  = V +small_value
             M =M + small_value
+            return jnp.log(p/init_i) * jnp.sqrt(V)
 
             # exponent = jnp.log(jnp.abs(p)/epsilon + 1)
             # pred = exponent < jnp.exp(V/M**2)
@@ -88,14 +98,16 @@ def mirror_descent_tuner(
             # theta = jax.lax.cond(exponent < jnp.exp(V/M**2), lambda: jnp.sqrt(exponent * V), lambda : 0.5 * M * (exponent  + V/M**2))
             # return theta
             # return jnp.sqrt(jnp.log(jnp.abs(p)/epsilon + 1) * V ) * jnp.sign(p)
-            return jnp.log(jnp.abs(p)/epsilon + 1) * jnp.sqrt(V) * jnp.sign(p)
+            # return jnp.log(jnp.abs(p)/epsilon + 1) * jnp.sqrt(V) * jnp.sign(p)
 
         def get_next_param(p_i, init_i, u_i, old_sum_i, next_sum_i, m_i):
 
-            old_theta = inv_link_fn(p_i - init_i, next_sum_i, m_i)
-
-            theta = beta * old_theta - u_i
-            next_p_i = link_fn(theta, next_sum_i, m_i) + init_i
+            # old_theta = inv_link_fn(p_i - init_i, next_sum_i, m_i, init_i)
+            old_theta = inv_link_fn(p_i,  next_sum_i, m_i, init_i)
+            theta = beta * old_theta - u_i #- u_i**2/jnp.sqrt(next_sum_i)
+            next_p_i = link_fn(theta, next_sum_i, m_i, init_i)
+            # jax.debug.print("theta: {}, next_sum_i: {}, u_i: {}", theta, jnp.sqrt(next_sum_i), u_i)
+            # next_p_i = link_fn(theta, next_sum_i, m_i, init_i) + init_i
             # fake_next_pi = link_fn(old_theta, next_sum_i, m_i) + init_i
             # next_p_i = jnp.sign(theta) * ((jnp.abs(p_i) + epsilon) * jnp.exp((-2 * u_i * old_theta + u_i**2)/(next_sum_i+small_value)) - epsilon)
             # fake_next_pi = jnp.sign(old_theta) * ((jnp.abs(p_i) + epsilon) * jnp.exp((-2 * 0 * old_theta + 0**2)/(next_sum_i+small_value)) - epsilon)
@@ -125,6 +137,7 @@ class AdditionState(NamedTuple):
     subparams: List[optax.Params]
 
 def add_optimizers(optimizers: Tuple[optax.GradientTransformation]):
+    '''wrapper for adding up a bunch of optimizer outputs'''
     def init_fn(params: optax.Params):
         substate = [opt.init(params) for opt in optimizers]
         subparams = [jtu.tree_map(jnp.array, params) for op in optimizers]
@@ -176,16 +189,18 @@ def mechanize_no_beta(
     )
 
 def summed_mirror_descent(betas = [1.0, 0.9, 0.99, 0.999, 0.9999, 0.99999, 0.999999]):
+    '''generate an optimizer by summing mirror descent optimizers for different beta values'''
     epsilons = [1.0/ (1e-8 + 1.0-b) for b in betas]
     eps_sum = sum(epsilons)
     epsilons = [eps * len(epsilons) / eps_sum for eps in epsilons]
     epsilons = [1e-8 for b in betas]
     md_tuners = [mirror_descent_tuner(beta=b, epsilon=eps) for b, eps in zip(betas, epsilons)]
     return add_optimizers(md_tuners)
+
+
 def mechanize(
     base_optimizer: optax.GradientTransformation,
     tuner_optimizer: optax.GradientTransformation = summed_mirror_descent(),
-    # tuner_optimizer = mirror_descent_tuner(1.0),
     s_init: float = 1e-8,
 ) -> optax.GradientTransformation:
     def init_fn(params: optax.Params):
@@ -216,7 +231,7 @@ def mechanize(
         # value of Delta.
         next_offset = tree_add(offset, base_updates)
 
-        inner_product = tree_dot(next_offset, grads)
+        inner_product = tree_dot(offset, grads)
 
         s_update, next_tuner_state = tuner_optimizer.update(
             inner_product, tuner_state, s
@@ -243,3 +258,4 @@ def mechanize(
         return updates, next_state
 
     return optax.GradientTransformation(init_fn, update_fn)
+

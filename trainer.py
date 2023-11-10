@@ -401,7 +401,6 @@ def run_epoch(
                 if summary_metrics[key] is None:
                     summary_metrics[key] = 0
                 log_data[f"{mode}/epoch_average/{key}"] = summary_metrics[key] / (it + 1)
-            logger(log_data)
         logger.commit(force=True)
 
     train_state = break_fn(train_state, config)

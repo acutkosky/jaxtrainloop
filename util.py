@@ -59,6 +59,12 @@ def reduce_state(state, new_state, reduce_fn=lambda x: jnp.mean(x, axis=0)):
 def zeros_like(tree: PyTree) -> PyTree:
     return jtu.tree_map(jnp.zeros_like, tree)
 
+def tree_dot_per_layer(v, w):
+    return jtu.tree_map(lambda vi, wi: jnp.sum(vi * wi), v, w)
+
+
+def tree_dot(v, w):
+    return jtu.tree_reduce(lambda x, y: x + y, tree_dot_per_layer(v, w))
 
 def tree_norm(tree):
     return jnp.sqrt(
@@ -67,6 +73,8 @@ def tree_norm(tree):
             jtu.tree_map(lambda x: jnp.sum(x * x), eqx.filter(tree, eqx.is_array)),
         )
     )
+
+
 
 
 def merge_dicts(*to_merge):

@@ -13,7 +13,7 @@ import time
 import mechanic as new_mechanic
 import duration
 import logstate
-
+import util
 
 
 class NoiseState(NamedTuple):
@@ -66,8 +66,6 @@ def skip_nonfinite(opt: optax.GradientTransformation) -> optax.GradientTransform
     return optax.GradientTransformation(init_fn, update_fn)
 
 
-
-
 def zero_if_nan(updates, params):
     return jax.lax.cond(all_finite(updates), lambda x: x, zeros_like, updates)
 
@@ -100,17 +98,55 @@ def anytime_avg():
     return optax.GradientTransformation(init_fn, update_fn)
 
 
-def scale_by_schedule_logged(schedule_fn):
-    def init_fn(self):
-        return logstate.LoggedState((jnp.array(0), duration.JaxTimeStamp()), log_data={"lr/schedule": jnp.array(0.0)})
+class ScheduleState(NamedTuple):
+    count: jax.Array
+    timestamp: duration.JaxTimeStamp
+    base_state: optax.OptState
 
-    def update_fn(updates, state, params):
-        (count, timestamp), log_data = state
+
+def scale_by_schedule_logged(
+    schedule_fn: Callable,
+    base_optimizer: optax.GradientTransformation,
+    config: DictConfig,
+):
+    def init_fn(params):
+        count = jnp.array(0)
+        timestamp = duration.JaxTimeStamp()
+        base_state = base_optimizer.init(params)
+
+        state = ScheduleState(count=count, timestamp=timestamp, base_state=base_state)
+        return logstate.LoggedState(state, log_data={"lr/schedule": jnp.array(0.0)})
+
+        # logstate.LoggedState((jnp.array(0), duration.JaxTimeStamp()), log_data={"lr/schedule": jnp.array(0.0)})
+
+    def update_fn(grads, state, params):
+        schedule_state, log_data = state
+        count = schedule_state.count
+        base_state = schedule_state.base_state
+        timestamp = schedule_state.timestamp
+
         count = count + 1
 
+        updates, base_state = base_optimizer.update(grads, base_state, params)
+
         schedule = schedule_fn(count, timestamp)
+
+        if config.grad_schedule:
+            schedule = schedule / jnp.abs(util.tree_dot(updates, grads))
+
         updates = jtu.tree_map(lambda x: schedule * x, updates)
         log_data = {"lr/schedule": schedule}
+
+        new_state = ScheduleState(
+            count=count,
+            timestamp=timestamp,
+            base_state=base_state,
+        )
+
+        new_state = logstate.LoggedState(state=new_state, log_data=log_data)
+
+        return updates, new_state
+
         return updates, logstate.LoggedState(
             state=(count, timestamp), log_data=log_data
         )
@@ -190,7 +226,13 @@ def get_optimizer(
         optimizer = optax.adamw(learning_rate=1.0, weight_decay=opt_config.weight_decay)
 
     if opt_config.bake_schedule:
-        optimizer = optax.chain(optimizer, scale_by_schedule_logged(schedule))
+        optimizer = scale_by_schedule_logged(schedule, optimizer, opt_config)
+        # optimizer = optax.chain(optimizer, scale_by_schedule_logged(schedule))
+
+    # we do gradient clipping before wrapping with mechanize, so mechanic sees the raw gradients
+    if opt_config.gradient_clip_val is not None:
+        grad_clip = optax.clip_by_global_norm(opt_config.gradient_clip_val)
+        optimizer = optax.chain(grad_clip, optimizer)
 
     if opt_config.mechanize:
         if opt_config.mechanize == "optax":
@@ -210,20 +252,15 @@ def get_optimizer(
 
             optimizer = log_optax(optimizer, log_fn)
 
-
     if not opt_config.bake_schedule:
-        optimizer = optax.chain(optimizer, scale_by_schedule_logged(schedule))
+        # optimizer = optax.chain(optimizer,
+        optimizer = scale_by_schedule_logged(schedule, optimizer, opt_config)
         # if not opt_config.mechanize:
         #     optimizer = optax.chain(optimizer, optax.scale(opt_config.lr))
 
     # optimizer = optax.apply_if_finite(optimizer, 15)
     optimizer = skip_nonfinite(optimizer)
     # optimizer = optax.chain(optimizer, optax.stateless(zero_if_nan))
-
-    # we do gradient clipping before anything else
-    if opt_config.gradient_clip_val is not None:
-        grad_clip = optax.clip_by_global_norm(opt_config.gradient_clip_val)
-        optimizer = optax.chain(grad_clip, optimizer)
 
     if config.averaging == "anytime":
         optimizer = optax.chain(optimizer, anytime_avg())

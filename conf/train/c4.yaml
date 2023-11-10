@@ -2,9 +2,9 @@
 defaults:
   - optim: adamw
 
-total_duration: "3hr"
-valid_frequency: "30min"
-valid_duration: "2min"
+total_duration: "50000it"
+valid_frequency: "5000it"
+valid_duration: "1000it"
 
 dataset: "c4"
 data_path: "/projectnb/aclab/datasets/c4/en/"

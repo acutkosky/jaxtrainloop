@@ -4,7 +4,8 @@ gradient_clip_val: 10.0
 # lr schedule shape and scale
 lr_warmup: 0.1
 lr_decay: linear
-lr: 0.0001
+lr: 0.0003
+grad_schedule: False
 
 weight_decay: 0.01
 batch_size: 4 # number of examples placed on each GPU
@@ -18,4 +19,5 @@ bake_schedule: True
 name: "adamw"
 
 momentum: 0.9
+
 
