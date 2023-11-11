@@ -253,43 +253,74 @@ class TrainDuration(eqx.Module):
     def __lt__(self, other):
         return other > self
 
+            
+            
+        
+        
 
 class TrainTime(TrainDuration):
     unit_to_value: Dict[str, jax.Array]
-    reference_timestamp: jax.Array
+    # reference_timestamp: jax.Array
 
     def __init__(self, *specs, resume: bool=False, reference_timestamp=None, **kw_spec):
         super().__init__(*specs, **kw_spec)
         for k in TIME_KEYS:
             if self.unit_to_value[k] is None:
                 self.unit_to_value[k] = 0.0
-        if len(specs) > 0 and isinstance(specs[0], TrainTime):
-            self.reference_timestamp = specs[0].reference_timestamp
-        else:
-            self.reference_timestamp = jnp.array(offset_hrs())
 
-        if resume:
-            current_time = offset_hrs()
-            self.reference_timestamp = current_time
-
-        if reference_timestamp is not None:
-            self.reference_timestamp = reference_timestamp
-
-    def set_reference_timestamp(self, value: jax.Array):
-        return eqx.tree_at(lambda t: t.reference_timestamp, self, value)
-
-    def update_elapsed_time(self):
-        current_time = offset_hrs()
-        if "hr" not in self:
-            return self.set_reference_time(current_time)
-        hrs_elapsed = current_time - self.reference_timestamp + self["hr"]
+    @jax.jit
+    def _update(self, **kwargs):
+        kvs = list(kwargs.items())
         return eqx.tree_at(
-            lambda t: (t.reference_timestamp, t.unit_to_value["hr"]),
+            lambda t: [t[k] for k,v in kvs],
             self,
-            (current_time, hrs_elapsed),
+            [v for k, v in kvs]
         )
+        # if len(specs) > 0 and isinstance(specs[0], TrainTime):
+        #     self.reference_timestamp = specs[0].reference_timestamp
+        # else:
+        #     self.reference_timestamp = jnp.array(offset_hrs())
+
+        # if resume:
+        #     current_time = offset_hrs()
+        #     self.reference_timestamp = current_time
+
+        # if reference_timestamp is not None:
+        #     self.reference_timestamp = reference_timestamp
+
+    # def set_reference_timestamp(self, value: jax.Array):
+    #     return eqx.tree_at(lambda t: t.reference_timestamp, self, value)
+
+    # def update_elapsed_time(self, **kwargs):
+    #     current_time = offset_hrs()
+    #     if "hr" not in self:
+    #         return self.set_reference_time(current_time)
+    #     hrs_elapsed = current_time - self.reference_timestamp + self["hr"]
+    #     return eqx.tree_at(
+    #         lambda t: (t.reference_timestamp, t.unit_to_value["hr"]),
+    #         self,
+    #         (current_time, hrs_elapsed),
+    #     )
 
 
+class TimeUpdater:
+
+    def __init__(self):
+        self.last_update = offset_hrs()
+
+
+    def update(self, train_time: TrainTime, **kwargs):
+        current_time = offset_hrs()
+        time_delta = current_time - self.last_update
+        new_hr = train_time.hr + time_delta
+        self.last_update  = current_time
+        kwargs["hr"] = new_hr
+        return train_time._update(**kwargs)
+
+
+    def __call__(self, train_time: TrainTime, **kwargs):
+        return self.update(train_time, **kwargs)
+            
 def elapsed(start_time: TrainTime, end_time: TrainTime, duration: TrainDuration):
     return (end_time - start_time) >= duration
 
