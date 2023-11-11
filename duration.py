@@ -3,9 +3,10 @@ import numpy as np
 import jax
 from jax import numpy as jnp
 import equinox as eqx
-from typing import Optional, Dict
+from typing import Optional, Dict, Sequence
 from jaxtyping import PyTree
 from jax import tree_util as jtu
+import re
 
 
 def safe(x):
@@ -18,6 +19,10 @@ def safe(x):
 # this is to avoid float32 roundoff headaches.
 # This hack will stop working eventually of course.
 START_TIME = 1699401021
+
+
+def offset_hrs():
+    return offset_time() / (60 * 60)
 
 
 def offset_time():
@@ -49,39 +54,120 @@ def set_timestamp(tree: PyTree, timestamp=None):
     return jtu.tree_map(update, tree, is_leaf=lambda x: isinstance(x, JaxTimeStamp))
 
 
-TIME_KEYS = ["epochs", "iterations", "hours"]
+TIME_KEYS = ["ep", "it", "hr", "ex", "tok"]
 
 
-class Time(eqx.Module):
-    epochs: Optional[int] = None
-    iterations: Optional[int] = None
-    hours: Optional[int] = None
+def number_regex_builder(decimal_allowed: bool, unit_name: str):
+    """
+    makes a regex that looks for things like 23123.123min
+    """
+    number_group = r"\d+"
+    if decimal_allowed:
+        number_group += r"(?:\.\d*)?"
 
-    def __init__(self, spec, epochs=None, iterations=None, hours=None):
-        # TODO: write this with regular expressions or something
-        # else less stupid
-        epochs = epochs
-        iterations = iterations
-        hours = hours
-        if isinstance(spec, Time):
-            self.epochs = spec.epochs
-            self.iterations = spec.iterations
-            self.hours = spec.hours
-        elif isinstance(spec, str):
-            if "ep" in spec:
-                self.epochs = int(spec.split("ep")[0])
-            if "it" in spec:
-                self.iterations = int(spec.split("it")[0])
-            if "min" in spec:
-                self.hours = float(spec.split("min")[0]) / 60
-            if "hr" in spec:
-                self.hours = float(spec.split("hr")[0])
+    # non-capturing group
+    unit_group = f"(?:{unit_name})"
+
+    return f"^({number_group}){unit_name}$"
+
+
+def parse_time_str(spec: str):
+    unit_to_value = {}
+    # epochs
+    regex = number_regex_builder(False, "ep")
+    match = re.match(regex, spec)
+    if match:
+        unit_to_value["ep"] = int(match.group(1))
+
+    # iterations
+    regex = number_regex_builder(False, "it")
+    match = re.match(regex, spec)
+    if match:
+        unit_to_value["it"] = int(match.group(1))
+
+    # hours
+    regex = number_regex_builder(True, "hr")
+    match = re.match(regex, spec)
+    if match:
+        unit_to_value["hr"] = float(match.group(1))
+
+    # minutes
+    regex = number_regex_builder(True, "min")
+    match = re.match(regex, spec)
+    if match:
+        unit_to_value["hr"] = float(match.group(1)) / 60.0
+
+    # days
+    regex = number_regex_builder(True, "day")
+    match = re.match(regex, spec)
+    if match:
+        unit_to_value["hr"] = float(match.group(1)) * 24.0
+
+    # examples
+    regex = number_regex_builder(False, "ex")
+    match = re.match(regex, spec)
+    if match:
+        unit_to_value["ex"] = int(match.group(1))
+
+    # tokens
+    regex = number_regex_builder(False, "tok")
+    match = re.match(regex, spec)
+    if match:
+        unit_to_value["tok"] = int(match.group(1))
+
+    if len(unit_to_value) == 0:
+        raise ValueError("unparseable time string!")
+
+    return unit_to_value
+
+
+class TrainDuration(eqx.Module):
+    unit_to_value: Dict[str, jax.Array]
+
+    def __init__(self, *specs, **kw_spec):
+        unit_to_value = {k: None for k in TIME_KEYS}
+        if len(specs) > 0:
+            if isinstance(specs[0], TrainDuration):
+                unit_to_value = specs[0].unit_to_value
+            else:
+                for spec in specs:
+                    unit_to_value.update(parse_time_str(spec))
+
+        for unit, value in kw_spec.items():
+            assert unit in TIME_KEYS or unit in ["min", "day"]
+            if unit == "min":
+                unit_to_value["hr"] = value / 60.0
+            elif unit == "day":
+                unit_to_value["hr"] = value * 24
+            else:
+                unit_to_value[unit] = value
+
+        self.unit_to_value = unit_to_value
 
     def __contains__(self, value: str):
         try:
-            return self[value] != None
+            return self[value] is not None
         except:
             return False
+
+    @property
+    def it(self):
+        return self["it"]
+    @property
+    def ep(self):
+        return self["ep"]
+    @property
+    def tok(self):
+        return self["tok"]
+    @property
+    def hr(self):
+        return self["hr"]
+    @property
+    def min(self):
+        return 60 *  self["hr"]
+    @property
+    def day(self):
+        return self["hr"]/24
 
     def keys(self):
         for x in TIME_KEYS:
@@ -95,68 +181,52 @@ class Time(eqx.Module):
     def __len__(self):
         return len(list(self.keys()))
 
-    def __getitem__(self, value: str):
-        if value in ["epochs", "ep"]:
-            return self.epochs
-
-        if value in ["iterations", "it"]:
-            return self.iterations
-        if value in ["hours", "hrs", "hr"]:
-            return self.hours
-
-        if value in ["min", "minutes", "mins"]:
-            return self.hours * 60
-
-        if value in ["sec", "seconds", "secs"]:
-            return self.hours * 60 * 60
-
-        raise KeyError
-
-    def _greater_than(self, other, strict: bool):
-        def compfunc(x, y):
-            if strict:
-                return x > y
-            else:
-                return x >= y
-
-        result = None
-
-        if len(self) > len(other):
-            raise ValueError("comparable Time objects must have same units!")
-
-        for u in self.keys():
-            if u not in other:
-                raise ValueError("comparable Time objects must have the same units!")
-            if result is None:
-                result = compfunc(self[u], other[u])
-            elif result != compfunc(self[u], other[u]):
-                raise ValueError("ambiguous comparison among time objects!")
-        return result
+    def __getitem__(self, k: str):
+        return self.unit_to_value[k]
 
     def __eq__(self, other):
         if len(self) != len(other):
             return False
-        for u in self.keys():
-            if self[u] != other[u]:
-                return False
-        return True
+        return jnp.all(jnp.array(jtu.tree_leaves(jtu.tree_map(lambda x,y: x==y, self, other))))
 
-    def set_epoch(self, value):
-        return Time(epochs=value, iterations=self.iterations, hours=self.hours)
-    def set_iterations(self, value):
-        return Time(epochs=self.epochs, iterations=value, hours=self.hours)
-    def set_hours(self, value):
-        return Time(epochs=self.epochs, iterations=self.iterations, hours=value)
+    def __ne__(self, other):
+        return jnp.logical_not(self == other)
+
+
+    def set_value(self, unit: str, value: jax.Array):
+        return eqx.tree_at(lambda t: t.unit_to_value[unit], self, value)
+
+    def get_timestamp(self):
+        return 60 * 60 * self.reference_timestamp + START_TIME
 
     def is_compatible(self, other):
         return len(self) == len(other)
 
-    def _arithmetic(self, other, operation):
-        if self.is_compatible(other):
-            raise ValueError("incompatible time arithmetic!")
+    def __truediv__(self, other):
+        if isinstance(other, TrainDuration):
+            results = [jnp.inf]
+            for k in TIME_KEYS:
+                if k in other and k in self:
+                    results.append(self[k] / other[k])
+            return jnp.min(jnp.array(results))
+        else:
+            values = {self[k] / other for k in self}
+            return TrainDuration(**values)
 
-        values = {u: operation(self[u], other[u]) for u in self.keys()}
-        return Time(**values)
+    def __mul__(self, other):
+        values = {self[k] / other for k in self}
+        return TrainDuration(**values)
+
+    def _arithmetic(self, other, operation):
+        values = {k: None for k in TIME_KEYS}
+        for k in TIME_KEYS:
+            if k in self and k in other:
+                values[k] = operation(self[k], other[k])
+            if k in self and k not in other:
+                values[k] = self[k]
+            if k not in self and k in other:
+                values[k] = other[k]
+        return TrainDuration(**values)
 
     def __add__(self, other):
         return self._arithmetic(other, lambda x, y: x + y)
@@ -164,83 +234,93 @@ class Time(eqx.Module):
     def __sub__(self, other):
         return self._arithmetic(other, lambda x, y: x - y)
 
-    def __ge__(self, other):
-        return self._comparison(other, strict=False)
+    def __gt__(self, other):
+        return jnp.logical_and(self >= other, self != other)
 
     def __le__(self, other):
         return other >= self
 
-    def __gt__(self, other):
-        return self._comparison(other, strict=True)
+    def __ge__(self, other):
+        result = None
+
+        results = []
+        for u in self.keys():
+            if u not in other:
+                continue
+            results.append(self[u] >= other[u])
+        return jnp.all(jnp.array(results))
 
     def __lt__(self, other):
         return other > self
 
 
+class TrainTime(TrainDuration):
+    unit_to_value: Dict[str, jax.Array]
+    reference_timestamp: jax.Array
+
+    def __init__(self, *specs, resume: bool=False, reference_timestamp=None, **kw_spec):
+        super().__init__(*specs, **kw_spec)
+        for k in TIME_KEYS:
+            if self.unit_to_value[k] is None:
+                self.unit_to_value[k] = 0.0
+        if len(specs) > 0 and isinstance(specs[0], TrainTime):
+            self.reference_timestamp = specs[0].reference_timestamp
+        else:
+            self.reference_timestamp = jnp.array(offset_hrs())
+
+        if resume:
+            current_time = offset_hrs()
+            self.reference_timestamp = current_time
+
+        if reference_timestamp is not None:
+            self.reference_timestamp = reference_timestamp
+
+    def set_reference_timestamp(self, value: jax.Array):
+        return eqx.tree_at(lambda t: t.reference_timestamp, self, value)
+
+    def update_elapsed_time(self):
+        current_time = offset_hrs()
+        if "hr" not in self:
+            return self.set_reference_time(current_time)
+        hrs_elapsed = current_time - self.reference_timestamp + self["hr"]
+        return eqx.tree_at(
+            lambda t: (t.reference_timestamp, t.unit_to_value["hr"]),
+            self,
+            (current_time, hrs_elapsed),
+        )
+
+
+def elapsed(start_time: TrainTime, end_time: TrainTime, duration: TrainDuration):
+    return (end_time - start_time) >= duration
+
+
+def broadcast_train_time(tree: PyTree, train_time: TrainTime):
+    def update(node):
+        if isinstance(node, TrainTime):
+            return TrainTime(train_time)
+        return node
+
+    return jtu.tree_map(update, tree, is_leaf=lambda x: isinstance(x, TrainTime))
+
+
 def minimum(*times):
     values = {k: None for k in TIME_KEYS}
 
+    times = [time.update_elapsed_time() for time in times]
     for k in values:
         for t in times:
             if k in t:
                 if values[k] is None:
                     values[k] = t[k]
                 values[k] = min(values[k], t[k])
-    return Time(**values)
+
+    reference = times[0].reference_timestamp
+    return TrainTime(resume=True, **values)
 
 
 PROGRAM_START = offset_time()
 
 
-def program_start() -> Time:
-    epochs = 0
-    iterations = 0
-    hours = PROGRAM_START
-
-
-def compatable_now(interval):
-    start_hours = None if interval.hours is None else offset_time()
-    start_epochs = None if interval.epochs is None else 0
-    start_iterations = None if interval.iterations is None else 0
-
-    now = Time(epochs=start_epochs, hours=start_epochs, iterations=start_iterations)
-    return now
- 
-
-class TimeDuration(eqx.Module):
-    start_time: Time
-    end_time: Time
-    interval: Time
-
-    def __init__(self, *specs, start_time=None):
-        self.interval = minimum(*[Time(spec) for spec in specs])
-        if self.interval.hours is not None:
-            start_hours = program_start()
-        else:
-            start_hours = None
-
-        if start_time is None:
-            start_time = compatable_now(self.interval)
-        self.start_time = start_time
-        self.end_time = self.start_time + self.interval
-
-    def reset(self, now: Time, overwrite_timestamp: bool=False):
-        if overwrite_timestamp:
-            now = now.set_hours(offset_time())
-        start_time = now
-        end_time = now + self.interval
-        interval = self.interval
-
-        return eqx.tree_at(
-            lambda t: (t.start_time, t.end_time, t.interval),
-            self,
-            (start_time, end_time, interval),
-        )
-
-
-    def elapsed(self, comparison: Time):
-        return comparison > end_time
-        
 
 
 class Duration:
