@@ -347,7 +347,7 @@ def run_epoch(
 
         #### Record metrics that should NOT be tagged with the current mode ####
         log_data.update(total_time.loggable_dict("total/"))
-        log_data["total/remaining_hr"] = total_time.hr  * (total_duration / train_state.time['train'])
+        log_data["total/remaining_hr"] = total_time.hr  * (total_duration / train_state.time['train']-1.0)
 
         if config.train.wandb_project is not None:
             logger(
