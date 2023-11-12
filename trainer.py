@@ -38,6 +38,9 @@ class ModelAndState(NamedTuple):
     model: eqx.Module
     state: Optional[eqx.nn.State]
 
+class OptimizerAndState(NamedTuple):
+    optimizer: optax.GradientTransformation
+    opt_state: optax.OptState
 
 def apply_model(model: ModelAndState, *args, **kwargs):
     module = model.module
@@ -48,8 +51,9 @@ def apply_model(model: ModelAndState, *args, **kwargs):
 
 class TrainState(NamedTuple):
     model: ModelAndState
-    opt_state: Any
-    optimizer: optax.GradientTransformation
+    optimizer: OptimizerAndState
+    # opt_state: Any
+    # optimizer: optax.GradientTransformation
     dynamic_scaler_state: Optional[DynamicScalerState]
     time: Dict[str, duration.TrainTime]
     aux: Any
@@ -118,9 +122,9 @@ def train_step(
         train_state = train_state.get_state()
     model = train_state.model.model
     state = train_state.model.state
-    opt_state = train_state.opt_state
+    opt_state = train_state.optimizer.opt_state
     dynamic_scaler_state = train_state.dynamic_scaler_state
-    optimizer = train_state.optimizer
+    optimizer = train_state.optimizer.optimizer
     aux = train_state.aux
     time = train_state.time
 
@@ -153,9 +157,10 @@ def train_step(
 
     new_train_state = TrainState(
         model=ModelAndState(model=model, state=state),
-        opt_state=opt_state,
+        optimizer=OptimizerAndState(optimizer=optimizer,opt_state=opt_state),
+        # opt_state=opt_state,
         dynamic_scaler_state=dynamic_scaler_state,
-        optimizer=optimizer,
+        # optimizer=optimizer,
         time=time,
         aux=aux,
     )
@@ -238,14 +243,14 @@ def run_epoch(
             jtu.Partial(train_step, loss_fn=loss_fn, config=config.train),
             donate="all",
         )
-        train_state = train_prepare(train_state, config)
-        break_fn = train_break
+        # train_state = train_prepare(train_state, config)
+        # break_fn = train_break
     else:
         step_fn_jit = eqx.filter_jit(
             jtu.Partial(inference_step, loss_fn=loss_fn, config=config.train),
         )
-        train_state = valid_prepare(train_state, config)
-        break_fn = valid_break
+        # train_state = valid_prepare(train_state, config)
+        # break_fn = valid_break
 
     exhausted_loader = True
     iteration_timing_events = ["iteration", "dataloader", "train_step"]
@@ -349,7 +354,7 @@ def run_epoch(
         log_data.update(total_time.loggable_dict("total/"))
         log_data["total/remaining_hr"] = total_time.hr  * (total_duration / train_state.time['train']-1.0)
 
-        if config.train.wandb_project is not None:
+        if logger is not None:
             logger(
                 log_data,
             )
@@ -367,7 +372,7 @@ def run_epoch(
     if exhausted_loader:
         train_state = time_updater(train_state.time[mode], train_state, ep=1)
 
-    if config.train.wandb_project is not None:
+    if logger is not None:
         for key in summary_metrics:
             if summary_metrics[key] is None:
                 summary_metrics[key] = 0
@@ -377,20 +382,21 @@ def run_epoch(
             )
         logger(log_data, force=True)
 
-    train_state = break_fn(train_state, config)
+    # train_state = break_fn(train_state, config)
 
     return train_state, exhausted_loader
 
 
 @hydra.main(version_base=None, config_path="conf", config_name="config_gpt2")
-def train(config: DictConfig) -> None:
+def train(config: DictConfig, data_loaders=None, model_state=None, optimizer_state=None) -> None:
     logging.info(OmegaConf.to_yaml(config))
 
     total_duration = duration.TrainDuration(config.train.total_duration)
     valid_freq = duration.TrainDuration(config.train.valid_frequency)
     valid_duration = duration.TrainDuration(config.train.valid_duration)
 
-    data_loaders = get_loader(config)
+    if data_loaders is None:
+        data_loaders = get_loader(config)
 
     if config.train.wandb_project is not None:
         wandb.init(project=config.train.wandb_project)
@@ -399,11 +405,15 @@ def train(config: DictConfig) -> None:
     else:
         limited_log = None
 
-    model, state = get_model(config, data_loaders)
+    if model_state is None:
+        model, state = get_model(config, data_loaders)
+        model_state = ModelAndState(model, state)
 
-    optimizer, opt_state = get_optimizer(
-        config.train, model, total_duration, data_loaders["train"], limited_log
-    )
+    if optimizer_state is None:
+        optimizer, opt_state = get_optimizer(
+            config.train, model_state.model, total_duration, data_loaders["train"], limited_log
+        )
+        optimizer_state  = OptimizerAndState(optimizer=optimizer, opt_state=opt_state)
 
     if config.train.use_amp:
         dynamic_scaler_state = DynamicScalerState(
@@ -413,16 +423,17 @@ def train(config: DictConfig) -> None:
         dynamic_scaler_state = None
 
     if config.train.averaging is not None and config.train.averaging != "none":
-        aux = copy_arrays(ModelAndState(model=model, state=state))
+        aux = copy_arrays(model_state)
+        # ModelAndState(model=model, state=state))
     else:
         aux = None
 
     train_time = duration.TrainTime(name="train")
     valid_time = duration.TrainTime(name="valid")
     train_state = TrainState(
-        model=ModelAndState(model=model, state=state),
-        opt_state=opt_state,
-        optimizer=optimizer,
+        model=model_state,
+        optimizer=optimizer_state,
+        # optimizer=optimizer,
         dynamic_scaler_state=dynamic_scaler_state,
         time={"train": train_time, "valid": valid_time},
         aux=aux,
@@ -450,6 +461,7 @@ def train(config: DictConfig) -> None:
     while True:
         # train...
         to_use, prng_key = jax.random.split(prng_key)
+        train_state = train_prepare(train_state, config)
         train_state, exhausted_train_loader = run_epoch(
             train_state,
             train_loader,
@@ -465,6 +477,7 @@ def train(config: DictConfig) -> None:
             batch_size_fn=batch_size_fn,
             total_duration=total_duration,
         )
+        train_state = train_break(train_state, config)
 
         print("\n")
 
@@ -476,6 +489,7 @@ def train(config: DictConfig) -> None:
             if config.train.valid_key is not None:
                 # valid_duration.reset(train_state.epoch, train_state.iteration)
                 to_use, prng_key = jax.random.split(prng_key)
+                train_state = valid_prepare(train_state, config)
                 train_state, exhausted_valid_loader = run_epoch(
                     train_state,
                     valid_loader,
@@ -491,6 +505,7 @@ def train(config: DictConfig) -> None:
                     batch_size_fn=batch_size_fn,
                     total_duration=total_duration,
                 )
+                train_state = valid_break(train_state, config)
                 if exhausted_valid_loader:
                     valid_pbar = tqdm.tqdm(
                         enumerate(data_loaders[config.train.valid_key])
