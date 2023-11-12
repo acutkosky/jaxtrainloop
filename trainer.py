@@ -243,14 +243,11 @@ def run_epoch(
             jtu.Partial(train_step, loss_fn=loss_fn, config=config.train),
             donate="all",
         )
-        # train_state = train_prepare(train_state, config)
-        # break_fn = train_break
     else:
         step_fn_jit = eqx.filter_jit(
             jtu.Partial(inference_step, loss_fn=loss_fn, config=config.train),
+            donate="all",
         )
-        # train_state = valid_prepare(train_state, config)
-        # break_fn = valid_break
 
     exhausted_loader = True
     iteration_timing_events = ["iteration", "dataloader", "train_step"]
@@ -382,7 +379,6 @@ def run_epoch(
             )
         logger(log_data, force=True)
 
-    # train_state = break_fn(train_state, config)
 
     return train_state, exhausted_loader
 

@@ -290,7 +290,7 @@ class TrainDuration(eqx.Module):
         return other > self
 
     def copy(self):
-        return jtu.tree_map(lambda x: x, self)
+        return jtu.tree_map(jnp.array, self)
 
 
 class TrainTime(TrainDuration):
