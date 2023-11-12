@@ -22,6 +22,7 @@ from collections import defaultdict
 import time
 import duration
 from ratelogger import RateLimitedLog
+import checkpoint
 
 import numpy as np
 
@@ -153,7 +154,7 @@ def train_step(
     model = eqx.apply_updates(model, updates)
 
     if config.averaging == "polyak":
-        aux = update_average(model, state, aux, time["train"].it)
+        aux['polyak'] = update_average(model, state, aux['polyak'], time["train"].it + 1)
 
     new_train_state = TrainState(
         model=ModelAndState(model=model, state=state),
@@ -197,7 +198,7 @@ def valid_prepare(train_state, config):
     model = train_state.model
     if config.train.averaging == "polyak":
         train_state = eqx.tree_at(
-            lambda t: (t.model, t.aux), train_state, replace=(aux, model)
+            lambda t: (t.model, t.aux['polyak']), train_state, replace=(aux['polyak'], model)
         )
     return train_state
 
@@ -207,7 +208,7 @@ def valid_break(train_state, config):
     model = train_state.model
     if config.train.averaging == "polyak":
         train_state = eqx.tree_at(
-            lambda t: (t.model, t.aux), train_state, replace=(aux, model)
+            lambda t: (t.model, t.aux['polyak']), train_state, replace=(aux['polyak'], model)
         )
 
     return train_state
@@ -226,6 +227,7 @@ def run_epoch(
     loss_fn: Callable,
     mode_start: duration.TrainDuration,
     mode_duration: duration.TrainDuration,
+    checkpoint_manager: checkpoint.CheckpointManager,
     total_duration: duration.TrainDuration,
     config: DictConfig,
     mode: str,
@@ -363,6 +365,9 @@ def run_epoch(
             + [f"{k}: {v:.2f}" for k, v in log_data.items() if k in pbar_inclusions]
         )
         pbar.set_description(pbar_desc)
+
+        if checkpoint_manager is not None:
+            checkpoint_manager.maybe_save(train_state, train_state.time[mode])
         if mode_duration < train_state.time[mode] - mode_start:
             exhausted_loader = False
             break
@@ -390,6 +395,8 @@ def train(config: DictConfig, data_loaders=None, model_state=None, optimizer_sta
     total_duration = duration.TrainDuration(config.train.total_duration)
     valid_freq = duration.TrainDuration(config.train.valid_frequency)
     valid_duration = duration.TrainDuration(config.train.valid_duration)
+
+    checkpoint_manager = checkpoint.CheckpointManager(config)
 
     if data_loaders is None:
         data_loaders = get_loader(config)
@@ -419,10 +426,10 @@ def train(config: DictConfig, data_loaders=None, model_state=None, optimizer_sta
         dynamic_scaler_state = None
 
     if config.train.averaging is not None and config.train.averaging != "none":
-        aux = copy_arrays(model_state)
+        aux = {'polyak': copy_arrays(model_state)}
         # ModelAndState(model=model, state=state))
     else:
-        aux = None
+        aux = {}
 
     train_time = duration.TrainTime(name="train")
     valid_time = duration.TrainTime(name="valid")
@@ -434,6 +441,9 @@ def train(config: DictConfig, data_loaders=None, model_state=None, optimizer_sta
         time={"train": train_time, "valid": valid_time},
         aux=aux,
     )
+
+    if config.train.get("load_path", False):
+        train_state = checkpoint_manager.load(train_state, name=config.train.load_path)
 
     prng_key = jr.PRNGKey(0)
 
@@ -470,6 +480,7 @@ def train(config: DictConfig, data_loaders=None, model_state=None, optimizer_sta
             prng_key=to_use,
             mode_start=train_start,
             mode_duration=valid_freq,
+            checkpoint_manager=checkpoint_manager,
             batch_size_fn=batch_size_fn,
             total_duration=total_duration,
         )
@@ -493,6 +504,7 @@ def train(config: DictConfig, data_loaders=None, model_state=None, optimizer_sta
                     loss_fn,
                     mode="valid",
                     mode_duration=valid_duration,
+                    checkpoint_manager=None,
                     config=config,
                     logger=limited_log,
                     time_keeper=time_keeper,

@@ -5,6 +5,8 @@ defaults:
 total_duration: "50000it"
 valid_frequency: "5000it"
 valid_duration: "1000it"
+checkpoint_interval: "1ep"
+checkpoint_path: "checkpoints/c4"
 
 dataset: "c4"
 data_path: "/projectnb/aclab/datasets/c4/en/"
