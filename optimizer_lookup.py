@@ -100,7 +100,7 @@ def anytime_avg():
 
 class ScheduleState(NamedTuple):
     count: jax.Array
-    timestamp: duration.JaxTimeStamp
+    train_time: duration.TrainTime
     base_state: optax.OptState
 
 
@@ -111,10 +111,10 @@ def scale_by_schedule_logged(
 ):
     def init_fn(params):
         count = jnp.array(0)
-        timestamp = duration.JaxTimeStamp()
+        train_time = duration.TrainTime()
         base_state = base_optimizer.init(params)
 
-        state = ScheduleState(count=count, timestamp=timestamp, base_state=base_state)
+        state = ScheduleState(count=count, train_time=train_time, base_state=base_state)
         return logstate.LoggedState(state, log_data={"lr/schedule": jnp.array(0.0)})
 
         # logstate.LoggedState((jnp.array(0), duration.JaxTimeStamp()), log_data={"lr/schedule": jnp.array(0.0)})
@@ -123,13 +123,13 @@ def scale_by_schedule_logged(
         schedule_state, log_data = state
         count = schedule_state.count
         base_state = schedule_state.base_state
-        timestamp = schedule_state.timestamp
+        train_time = schedule_state.train_time
 
         count = count + 1
 
         updates, base_state = base_optimizer.update(grads, base_state, params)
 
-        schedule = schedule_fn(count, timestamp)
+        schedule = schedule_fn(count, train_time)
 
         if config.grad_schedule:
             schedule = schedule / jnp.abs(util.tree_dot(updates, grads))
@@ -139,7 +139,7 @@ def scale_by_schedule_logged(
 
         new_state = ScheduleState(
             count=count,
-            timestamp=timestamp,
+            train_time=train_time,
             base_state=base_state,
         )
 
@@ -147,33 +147,31 @@ def scale_by_schedule_logged(
 
         return updates, new_state
 
-        return updates, logstate.LoggedState(
-            state=(count, timestamp), log_data=log_data
-        )
 
     return optax.GradientTransformation(init_fn, update_fn)
 
 
 def schedule_fn(
     count: int,
-    timestamp: duration.JaxTimeStamp,
+    train_time: duration.TrainTime,
     config: DictConfig,
-    train_duration: Duration,
+    train_duration: duration.TrainDuration,
     loader: Any,
     peak: float,
     # logger: Optional[Callable] = None,
 ):
-    if train_duration.minutes != float("inf"):
-        train_elapsed = jnp.asarray(
-            (timestamp.timestamp / 60 - train_duration.start_time)
-            / train_duration.minutes
-        )
-    else:
-        if train_duration.iterations != float("inf"):
-            max_iter = train_duration.iterations
-        if train_duration.epochs != float("inf"):
-            max_iter = len(loader) * train_duration.epochs
-        train_elapsed = count / max_iter
+    train_elapsed = train_time/train_duration
+    # if train_duration.minutes != float("inf"):
+    #     train_elapsed = jnp.asarray(
+    #         (timestamp.timestamp / 60 - train_duration.start_time)
+    #         / train_duration.minutes
+    #     )
+    # else:
+    #     if train_duration.iterations != float("inf"):
+    #         max_iter = train_duration.iterations
+    #     if train_duration.epochs != float("inf"):
+    #         max_iter = len(loader) * train_duration.epochs
+    #     train_elapsed = count / max_iter
 
     warmup = config.lr_warmup
 
@@ -200,7 +198,7 @@ def schedule_fn(
 def get_optimizer(
     config: DictConfig,
     model: eqx.Module,
-    train_duration: Duration,
+    train_duration: duration.TrainDuration,
     train_loader,
     logger: Optional[Callable] = None,
 ):

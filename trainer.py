@@ -5,7 +5,7 @@ from jax import random as jr
 from jax.random import PRNGKey, PRNGKeyArray
 from jaxamp import amp, DynamicScalerState, dynamic_scale_value_and_grad
 from jaxtyping import Array, PyTree
-from typing import Tuple, Any, Optional, Sequence, Union, NamedTuple, Callable
+from typing import Tuple, Any, Optional, Sequence, Union, NamedTuple, Callable, Dict
 import hydra
 from omegaconf import OmegaConf, DictConfig
 import equinox as eqx
@@ -21,6 +21,8 @@ import wandb
 from collections import defaultdict
 import time
 from duration import Duration, set_timestamp
+import duration
+from ratelogger import RateLimitedLog
 
 import numpy as np
 
@@ -50,8 +52,7 @@ class TrainState(NamedTuple):
     opt_state: Any
     optimizer: optax.GradientTransformation
     dynamic_scaler_state: Optional[DynamicScalerState]
-    iteration: Array
-    epoch: Array
+    time: Dict[str, duration.TrainTime]
     aux: Any
 
 
@@ -75,9 +76,6 @@ def inference_step(
         train_state = train_state.get_state()
     model = train_state.model.model
     state = train_state.model.state
-
-    # if config.use_amp:
-    #     loss_fn = amp(loss_fn, compute_dtype=get_dtype(config.precision))
 
     loss, (state, log_data) = loss_fn(model, state, batch, key=prng_key)
 
@@ -125,11 +123,9 @@ def train_step(
     dynamic_scaler_state = train_state.dynamic_scaler_state
     optimizer = train_state.optimizer
     aux = train_state.aux
-    epoch = train_state.epoch
-    iteration = train_state.iteration
+    time = train_state.time
 
     if config.use_amp:
-        # amp_loss_fn = amp(loss_fn, compute_dtype=get_dtype(config.precision))
         value_and_grad_fn = dynamic_scale_value_and_grad(
             loss_fn, filter=True, has_aux=True, redo_on_nan=0
         )
@@ -153,18 +149,15 @@ def train_step(
     )
     model = eqx.apply_updates(model, updates)
 
-    iteration = iteration + 1
-    epoch = epoch
     if config.averaging == "polyak":
-        aux = update_average(model, state, aux, iteration)
+        aux = update_average(model, state, aux, time["train"].it)
 
     new_train_state = TrainState(
         model=ModelAndState(model=model, state=state),
         opt_state=opt_state,
         dynamic_scaler_state=dynamic_scaler_state,
         optimizer=optimizer,
-        iteration=iteration,
-        epoch=epoch,
+        time=time,
         aux=aux,
     )
 
@@ -177,28 +170,8 @@ def train_step(
     return loss, logged_state, all_logs
 
 
-class RateLimitedWandbLog:
-    def __init__(self, max_frequency=1.0):
-        self.max_frequency = 1.0
-        self.last_time = time.time() - 1.0 / self.max_frequency
-        self.metrics = {}
-
-    def __call__(self, metrics, *args, commit=True, force=False, **kwargs):
-        self.metrics.update(metrics)
-        if commit:
-            self.commit(force=force, *args, **kwargs)
-
-    def commit(self, force=False, *args, **kwargs):
-        if len(self.metrics) != 0:
-            cur_time = time.time()
-            if force or cur_time >= self.last_time + 1.0 / self.max_frequency:
-                wandb.log(self.metrics, *args, **kwargs)
-                self.last_time = cur_time
-                self.metrics = {}
-
 
 def train_prepare(train_state, config):
-    # return train_state
     return eqx.tree_at(
         lambda t: t.model.model,
         train_state,
@@ -211,7 +184,6 @@ def train_break(train_state, config):
 
 
 def valid_prepare(train_state, config):
-    # return train_state
     train_state = eqx.tree_at(
         lambda t: t.model.model,
         train_state,
@@ -220,7 +192,6 @@ def valid_prepare(train_state, config):
     aux = train_state.aux
     model = train_state.model
     if config.train.averaging == "polyak":
-        print("switching!")
         train_state = eqx.tree_at(
             lambda t: (t.model, t.aux), train_state, replace=(aux, model)
         )
@@ -231,7 +202,6 @@ def valid_break(train_state, config):
     aux = train_state.aux
     model = train_state.model
     if config.train.averaging == "polyak":
-        print("switching back!")
         train_state = eqx.tree_at(
             lambda t: (t.model, t.aux), train_state, replace=(aux, model)
         )
@@ -250,11 +220,14 @@ def run_epoch(
     dataloader: Any,
     pbar: Any,
     loss_fn: Callable,
-    stop_time: Duration,
+    mode_start: duration.TrainDuration,
+    mode_duration: duration.TrainDuration,
+    total_duration: duration.TrainDuration,
     config: DictConfig,
     mode: str,
     time_keeper: TimeKeeper,
     logger: Callable,
+    batch_size_fn: Callable,
     prng_key: Array,
 ):
     mode = mode.lower()
@@ -277,70 +250,61 @@ def run_epoch(
 
     exhausted_loader = True
     iteration_timing_events = ["iteration", "dataloader", "train_step"]
-    time_keeper.mark(start_events=["dataloader", "iteration", "tokens", "samples"])
-    start_iter = np.array(train_state.iteration)
+    time_keeper.mark(start_events=["dataloader", "iteration", "tokens", "examples"])
     it = -1
     summary_metrics = {"loss": None, "accuracy": None}
+    time_updater = duration.TimeUpdater()
+    time_updater.start(mode)
     while True:
         try:
-            idt, batch = next(dataloader)
+            iter_in_epoch, batch = next(dataloader)
         except StopIteration:
             break
         it += 1
         batch = util.pytorch_to_np(batch)
 
-        # bit of a hack:  some data type (like lists of numpy arrays)
-        # will get made here, so we  just skip it.
-        # tricky: we need to count the tokens BEFORE sending  to the step_fn
-        # because we are going to donate all the buffers.
-        try:
-            if "attention_mask" in batch:
-                tokens = util.count_tokens(batch["attention_mask"])
-            else:
-                tokens = None
-        except ValueError:
-            tokens = None
+        # tricky: we need to compute the size info BEFORE sending to the
+        # step_fn because we are going to donate all the buffers.
+        batch_size = batch_size_fn(batch)
+
         time_keeper.mark(end_events={"dataloader": 1}, start_events=["train_step"])
         to_use, prng_key = jr.split(prng_key)
-        train_state = set_timestamp(train_state)
         loss, train_state, log_data = step_fn_jit(train_state, batch, prng_key=to_use)
-        # print("log_list: ",log_list)
+        train_state = time_updater(
+            train_state.time[mode], train_state, **batch_size.dict()
+        )
+
+        total_time = sum(train_state.time.values())
+
+
+
 
         time_keeper.mark(
             end_events={"train_step": 1},
         )
 
         #### Record metrics that should be tagged with the current mode ####
-
-        if tokens is not None:
-            log_data["tokens"] = tokens
-        if "tokens" in log_data:
-            total_tokens += log_data["tokens"]
-            log_data["total_tokens"] = total_tokens
-
-        log_data["iter_in_epoch"] = it
         log_data["loss"] = loss
+        log_data.update(batch_size.loggable_dict("batch/"))
+        log_data.update(train_state.time[mode].loggable_dict("time/"))
 
-        pbar_desc = ", ".join(
-            [f"{mode} ep: {train_state.epoch}"]
-            + [f"{k}: {v:.2f}" for k, v in log_data.items()]
-            + [f"total_it: {train_state.iteration}"]
-        )
-        pbar.set_description(pbar_desc)
+        log_data["iter_in_epoch"] = iter_in_epoch
 
-        tokens = log_data.get("tokens", 0)
-        samples = log_data["samples"]
         time_keeper.mark(
-            start_events=["dataloader", "iteration", "tokens", "samples"],
-            end_events={"iteration": 1, "tokens": tokens, "samples": samples},
+            start_events=["dataloader", "iteration", "tokens", "examples"],
+            end_events={
+                "iteration": batch_size.it,
+                "tokens": batch_size.tok,
+                "examples": batch_size.ex,
+            },
         )
-        durations = time_keeper.get_durations()
+        intervals = time_keeper.get_intervals()
         proportions = time_keeper.get_proportions()
         log_data.update(
             {
-                f"time/secs_per/{k}": durations[k]
+                f"time/secs_per/{k}": intervals[k]
                 for k in iteration_timing_events
-                if k in durations
+                if k in intervals
             }
         )
 
@@ -363,13 +327,13 @@ def run_epoch(
             }
         )
 
-        if "iteration" in durations:
+        if "iteration" in intervals:
             throughput = {
-                "throughput/iteration_per_sec": 1.0 / durations["iteration"],
-                "throughput/samples_per_sec": 1.0 / durations["samples"],
+                "throughput/iteration_per_sec": 1.0 / intervals["iteration"],
+                "throughput/examples_per_sec": 1.0 / intervals["examples"],
             }
             if "tokens" in log_data:
-                throughput["throughput/tokens_per_sec"] = 1.0 / durations["tokens"]
+                throughput["throughput/tokens_per_sec"] = 1.0 / intervals["tokens"]
             log_data.update(throughput)
 
         for key in summary_metrics:
@@ -383,45 +347,56 @@ def run_epoch(
         log_data = {f"{mode}/{k}": v for k, v in log_data.items()}
 
         #### Record metrics that should NOT be tagged with the current mode ####
-        log_data["epoch"] = np.array(train_state.epoch)
-        log_data["total_iter"] = np.array(train_state.iteration)
+        log_data.update(total_time.loggable_dict("total/"))
+        log_data["total/remaining_hr"] = total_time.hr  * (total_duration / train_state.time['train'])
 
         if config.train.wandb_project is not None:
             logger(
                 log_data,
             )
 
-        if stop_time.elapsed(np.array(train_state.epoch), it + start_iter + 1):
+        pbar_inclusions = ["total/iteration", "train/iter_in_epoch"]
+        pbar_desc = ", ".join(
+            [f"{mode} ep: {train_state.time[mode].ep}"]
+            + [f"loss: {loss:.2f}"]
+            + [f"{k}: {v:.2f}" for k, v in log_data.items() if k in pbar_inclusions]
+        )
+        pbar.set_description(pbar_desc)
+        if mode_duration < train_state.time[mode] - mode_start:
             exhausted_loader = False
             break
+    if exhausted_loader:
+        train_state = time_updater(train_state.time[mode], train_state, ep=1)
 
     if config.train.wandb_project is not None:
-        if exhausted_loader:
-            for key in summary_metrics:
-                if summary_metrics[key] is None:
-                    summary_metrics[key] = 0
-                log_data[f"{mode}/epoch_average/{key}"] = summary_metrics[key] / (it + 1)
-        logger.commit(force=True)
+        for key in summary_metrics:
+            if summary_metrics[key] is None:
+                summary_metrics[key] = 0
+            print("adding metric: ", summary_metrics[key]/(it+1))
+            log_data[f"{mode}/full_average/{key}"] = summary_metrics[key] / (
+                it + 1
+            )
+        logger(log_data, force=True)
 
     train_state = break_fn(train_state, config)
 
-    return train_state, prng_key, exhausted_loader
+    return train_state, exhausted_loader
 
 
 @hydra.main(version_base=None, config_path="conf", config_name="config_gpt2")
 def train(config: DictConfig) -> None:
     logging.info(OmegaConf.to_yaml(config))
 
-    total_duration = Duration(config.train.total_duration)
-    valid_freq = Duration(config.train.total_duration, config.train.valid_frequency)
-    valid_duration = Duration(config.train.total_duration, config.train.valid_duration)
+    total_duration = duration.TrainDuration(config.train.total_duration)
+    valid_freq = duration.TrainDuration(config.train.valid_frequency)
+    valid_duration = duration.TrainDuration(config.train.valid_duration)
 
     data_loaders = get_loader(config)
 
     if config.train.wandb_project is not None:
-        limited_log = RateLimitedWandbLog(config.train.wandb_logs_per_sec)
         wandb.init(project=config.train.wandb_project)
         wandb.config.update(OmegaConf.to_container(config))
+        limited_log = RateLimitedLog(wandb.log, config.train.wandb_logs_per_sec)
     else:
         limited_log = None
 
@@ -443,13 +418,14 @@ def train(config: DictConfig) -> None:
     else:
         aux = None
 
+    train_time = duration.TrainTime(name="train")
+    valid_time = duration.TrainTime(name="valid")
     train_state = TrainState(
         model=ModelAndState(model=model, state=state),
         opt_state=opt_state,
         optimizer=optimizer,
         dynamic_scaler_state=dynamic_scaler_state,
-        iteration=jnp.array(0),
-        epoch=jnp.array(0),
+        time={"train": train_time, "valid": valid_time},
         aux=aux,
     )
 
@@ -467,43 +443,54 @@ def train(config: DictConfig) -> None:
         valid_pbar = tqdm.tqdm(enumerate(data_loaders[config.train.valid_key]))
         valid_loader = iter(valid_pbar)
 
-    total_duration.reset()
-    valid_duration.reset()
-    valid_freq.reset()
 
+    train_start = duration.TrainTime()
+    valid_start = duration.TrainTime()
+
+    batch_size_fn = data_loaders["batch_size_fn"]
     while True:
         # train...
-        train_state, prng_key, exhausted_train_loader = run_epoch(
+        to_use, prng_key = jax.random.split(prng_key)
+        train_state, exhausted_train_loader = run_epoch(
             train_state,
             train_loader,
             train_pbar,
             loss_fn,
             mode="train",
             config=config,
-            stop_time=valid_freq,
             logger=limited_log,
             time_keeper=time_keeper,
-            prng_key=prng_key,
+            prng_key=to_use,
+            mode_start=train_start,
+            mode_duration=valid_freq,
+            batch_size_fn=batch_size_fn,
+            total_duration=total_duration,
         )
 
-        next_epoch_number = train_state.epoch + exhausted_train_loader
-        if not exhausted_train_loader:
-            print("\n")
+        print("\n")
 
-        if valid_freq.elapsed_and_reset(next_epoch_number, train_state.iteration):
+        if train_state.time["train"] - train_start > valid_freq:
+            train_start = train_state.time["train"].copy()
+            valid_start = train_state.time["valid"].copy()
+            # it doesn't make sense to have valid_duration > 1ep, so
+            # we don't need to consider this case.
             if config.train.valid_key is not None:
-                valid_duration.reset(train_state.epoch, train_state.iteration)
-                train_state, prng_key, exhausted_valid_loader = run_epoch(
+                # valid_duration.reset(train_state.epoch, train_state.iteration)
+                to_use, prng_key = jax.random.split(prng_key)
+                train_state, exhausted_valid_loader = run_epoch(
                     train_state,
                     valid_loader,
                     valid_pbar,
                     loss_fn,
-                    mode=config.train.valid_key,
-                    stop_time=valid_duration,
+                    mode="valid",
+                    mode_duration=valid_duration,
                     config=config,
                     logger=limited_log,
                     time_keeper=time_keeper,
-                    prng_key=prng_key,
+                    prng_key=to_use,
+                    mode_start=valid_start,
+                    batch_size_fn=batch_size_fn,
+                    total_duration=total_duration,
                 )
                 if exhausted_valid_loader:
                     valid_pbar = tqdm.tqdm(
@@ -515,14 +502,11 @@ def train(config: DictConfig) -> None:
         # postpone incrementing the epoch count until we've logged all the
         # validation data.
         if exhausted_train_loader:
-            train_state = eqx.tree_at(
-                lambda t: t.epoch, train_state, train_state.epoch + 1
-            )
             train_pbar = tqdm.tqdm(enumerate(data_loaders["train"]))
             train_loader = iter(train_pbar)
         # make a newline so that the progress bar has a new line too...
         print("\n")
-        if total_duration.elapsed(train_state.epoch, train_state.iteration):
+        if train_state.time["train"] > total_duration:
             break
 
 

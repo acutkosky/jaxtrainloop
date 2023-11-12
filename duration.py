@@ -9,6 +9,7 @@ from jax import tree_util as jtu
 import re
 
 
+
 def safe(x):
     if eqx.is_array(x):
         return np.array(x)
@@ -144,10 +145,30 @@ class TrainDuration(eqx.Module):
 
         self.unit_to_value = unit_to_value
 
+    def dict(self):
+        return {k: v for k, v in self.items()}
+
+    def loggable_dict(self, prefix=""):
+        full_names = {
+            'it': 'iteration',
+            'ep': 'epoch',
+            'tok': 'tokens',
+            'ex': 'examples',
+            'hr': 'hours',
+        }
+        result = {}
+        for k,v in self.items():
+            result[prefix + full_names[k]] = v
+            if k == 'hr':
+                result[prefix+'seconds'] = v * 60 * 60
+                result[prefix+'minutes'] = v * 60
+        return result
+
+
     def __contains__(self, value: str):
         try:
             return self[value] is not None
-        except:
+        except KeyError:
             return False
 
     @property
@@ -184,7 +205,7 @@ class TrainDuration(eqx.Module):
                 yield x
 
     def items(self):
-        for x in self:
+        for x in self.keys():
             yield x, self[x]
 
     def __len__(self):
@@ -239,7 +260,12 @@ class TrainDuration(eqx.Module):
         return TrainDuration(**values)
 
     def __add__(self, other):
+        if not isinstance(other, TrainDuration):
+            other = TrainDuration(**{k: other for k in TIME_KEYS})
         return self._arithmetic(other, lambda x, y: x + y)
+
+    def __radd__(self, other):
+        return self + other
 
     def __sub__(self, other):
         return self._arithmetic(other, lambda x, y: x - y)
@@ -263,15 +289,18 @@ class TrainDuration(eqx.Module):
     def __lt__(self, other):
         return other > self
 
+    def copy(self):
+        return jtu.tree_map(lambda x: x, self)
+
 
 class TrainTime(TrainDuration):
     unit_to_value: Dict[str, jax.Array]
+    name: str = eqx.field(static=True)
     # reference_timestamp: jax.Array
 
-    def __init__(
-        self, *specs, resume: bool = False, reference_timestamp=None, **kw_spec
-    ):
+    def __init__(self, *specs, name="train", **kw_spec):
         super().__init__(*specs, **kw_spec)
+        self.name = name
         for k in TIME_KEYS:
             if self.unit_to_value[k] is None:
                 self.unit_to_value[k] = 0.0
@@ -286,37 +315,42 @@ class TrainTime(TrainDuration):
 
 class TimeUpdater:
     def __init__(self):
-        self.last_update = offset_hrs()
+        self.last_update = {'train': offset_hrs()}
+
+    def start(self, *names):
+        for name in names:
+            self.last_update[name] = offset_hrs()
 
     def update(self, train_time: TrainTime, time_delta=None, **kwargs):
         if time_delta is None:
             current_time = offset_hrs()
             time_delta = current_time - self.last_update
-            self.last_update = current_time
+            self.last_update[train_time.name] = current_time
         kwargs["hr"] = time_delta
         return train_time._update(**kwargs)
 
     def __call__(self, ref_time: TrainTime, tree: Optional[PyTree] = None, **kwargs):
         current_time = offset_hrs()
-        time_delta = current_time - self.last_update
-        self.last_update = current_time
+        time_delta = current_time - self.last_update[ref_time.name]
+        self.last_update[ref_time.name] = current_time
         kwargs["hr"] = time_delta
         ref_time = ref_time._update(**kwargs)
         if tree is None:
             return ref_time
         else:
-            return broadcast_train_time(tree, ref_time)
+            return broadcast_time(tree, ref_time)
 
+        
 
 def elapsed(start_time: TrainTime, end_time: TrainTime, duration: TrainDuration):
     return (end_time - start_time) >= duration
 
 
-@jax.jit
-def broadcast_train_time(tree: PyTree, train_time: TrainTime):
+@eqx.filter_jit
+def broadcast_time(tree: PyTree, ref_time: TrainTime):
     def update(node):
-        if isinstance(node, TrainTime):
-            return TrainTime(train_time)
+        if isinstance(node, TrainTime) and node.name == ref_time.name:
+            return ref_time.copy()
         return node
 
     return jtu.tree_map(update, tree, is_leaf=lambda x: isinstance(x, TrainTime))
