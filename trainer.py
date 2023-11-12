@@ -20,7 +20,6 @@ import ml_dtypes
 import wandb
 from collections import defaultdict
 import time
-from duration import Duration, set_timestamp
 import duration
 from ratelogger import RateLimitedLog
 

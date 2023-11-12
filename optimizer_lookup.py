@@ -7,7 +7,6 @@ from jaxtyping import PyTree
 from omegaconf import DictConfig
 from typing import Optional, Any, Callable
 from util import log_optax, key_tree, zeros_like
-from duration import Duration
 from typing import NamedTuple
 import time
 import mechanic as new_mechanic
