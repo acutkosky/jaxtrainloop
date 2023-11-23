@@ -4,7 +4,7 @@ defaults:
 total_duration: "200ep"
 valid_frequency: "1ep"
 valid_duration: "1ep"
-checkpoint_interval: "1ep"
+checkpoint_interval: null
 checkpoint_path: "checkpoints/cifar/resnet"
 
 dataset: "cifar10"

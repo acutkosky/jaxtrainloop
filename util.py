@@ -12,6 +12,22 @@ import torch
 import logstate
 
 
+def tree_add(a, b):
+    return jtu.tree_map(lambda a_i, b_i: a_i + b_i, a, b)
+
+
+def tree_subtract(a, b):
+    return jtu.tree_map(lambda a_i, b_i: a_i - b_i, a, b)
+
+
+def tree_dot_per_layer(v, w):
+    return jtu.tree_map(lambda vi, wi: jnp.sum(vi * wi), v, w)
+
+
+def tree_dot(v, w):
+    return jtu.tree_reduce(lambda x, y: x + y, tree_dot_per_layer(v, w))
+
+
 def same_shape_leaf(l1, l2):
     if eqx.is_array(l1) != eqx.is_array(l2):
         return False

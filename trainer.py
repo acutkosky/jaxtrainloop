@@ -289,7 +289,6 @@ def run_epoch(
         #### Record metrics that should be tagged with the current mode ####
         log_data["loss"] = loss
         log_data.update(batch_size.loggable_dict("batch/"))
-        log_data.update(train_state.time[mode].loggable_dict("time/"))
 
         log_data["iter_in_epoch"] = iter_in_epoch
 
@@ -348,6 +347,10 @@ def run_epoch(
 
         #### Add mode tag to current metrics ####
         log_data = {f"{mode}/{k}": v for k, v in log_data.items()}
+
+        #### Add time metrics for all modes ####
+        for m in train_state.time:
+            log_data.update(train_state.time[m].loggable_dict(f"{m}/time/"))
 
         #### Record metrics that should NOT be tagged with the current mode ####
         log_data.update(total_time.loggable_dict("total/"))

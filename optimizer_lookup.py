@@ -13,6 +13,8 @@ import mechanic as new_mechanic
 import duration
 import logstate
 import util
+import optadam
+import optadam_harsh
 
 
 class NoiseState(NamedTuple):
@@ -96,6 +98,13 @@ def anytime_avg():
 
     return optax.GradientTransformation(init_fn, update_fn)
 
+
+def flip_sign():
+    def init_fn(params):
+        return None
+    def update_fn(updates, state, params):
+        return jtu.tree_map(lambda x : -x, updates), state
+    return optax.GradientTransformation(init_fn, update_fn)
 
 class ScheduleState(NamedTuple):
     count: jax.Array
@@ -221,6 +230,13 @@ def get_optimizer(
         )
     elif opt_config.name == "adamw":
         optimizer = optax.adamw(learning_rate=1.0, weight_decay=opt_config.weight_decay)
+    elif opt_config.name == "opt_adam":
+        optimizer = optadam.opt_adam(beta1=opt_config.beta1, beta2=opt_config.beta2, weight_decay=opt_config.weight_decay)
+    elif opt_config.name == "opt_adam_harsh":
+        optimizer = optax.chain(
+            optax.add_decayed_weights(weight_decau=opt_config.weight_decay),
+            optadam_harsh.scale_by_opt_laprop(opt_config.beta1, opt_config.beta2)
+        )
 
     if opt_config.bake_schedule:
         optimizer = scale_by_schedule_logged(schedule, optimizer, opt_config)

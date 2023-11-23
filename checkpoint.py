@@ -1,18 +1,26 @@
 import duration
 import time
 import pathlib
-import os
-from jax import tree_util as jtu
 import equinox as eqx
 
 
 class CheckpointManager:
     def __init__(self, config):
-        self.interval = duration.TrainDuration(config.train.checkpoint_interval)
+        if config.train.checkpoint_interval is not None:
+            self.interval = duration.TrainDuration(config.train.checkpoint_interval)
+        else:
+            self.interval = None
         self.last_checkpoint = duration.TrainTime()
-        self.checkpoint_path = pathlib.Path(config.train.checkpoint_path)
+        if config.train.checkpoint_path is not None:
+            self.checkpoint_path = pathlib.Path(config.train.checkpoint_path)
+        else:
+            self.checkpoint_path = None
 
     def maybe_save(self, train_state, train_time):
+        if self.interval is None:
+            return
+        if self.checkpoint_path is None:
+            return
         if self.interval < train_time - self.last_checkpoint:
             self.last_checkpoint = train_time.copy()
             filename = self.checkpoint_path / f"checkpoint.{int(time.time())}.tree"

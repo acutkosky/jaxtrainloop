@@ -12,7 +12,7 @@ optim:
 total_duration: "100ep"
 valid_frequency: "1ep"
 valid_duration: "1ep"
-checkpoint_interval: "1ep"
+checkpoint_interval: null
 checkpoint_path: "checkpoints/abs"
 
 dataset: constant
