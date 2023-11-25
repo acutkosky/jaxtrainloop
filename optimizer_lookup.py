@@ -283,9 +283,6 @@ def get_optimizer(
         # if not opt_config.mechanize:
         #     optimizer = optax.chain(optimizer, optax.scale(opt_config.lr))
 
-    # optimizer = optax.apply_if_finite(optimizer, 15)
-    optimizer = skip_nonfinite(optimizer)
-    # optimizer = optax.chain(optimizer, optax.stateless(zero_if_nan))
 
     if config.averaging == "anytime":
         optimizer = optax.chain(optimizer, anytime_avg())
@@ -293,6 +290,17 @@ def get_optimizer(
     if config.get("gradient_noise", 0) != 0:
         optimizer = optax.chain(
             add_noise(config.gradient_noise, jax.random.PRNGKey(1231)), optimizer
+        )
+    # optimizer = optax.apply_if_finite(optimizer, 15)
+    optimizer = skip_nonfinite(optimizer)
+    # optimizer = optax.chain(optimizer, optax.stateless(zero_if_nan))
+
+    if opt_config.accumulation_steps != 1:
+        optimizer = optax.MultiSteps(
+            optimizer,
+            every_k_schedule=opt_config.accumulation_steps,
+            use_grad_mean=True,
+            should_skip_update_fn=optax.skip_not_finite,
         )
 
     opt_state = optimizer.init(jtu.tree_map(jnp.array, eqx.filter(model, eqx.is_array)))

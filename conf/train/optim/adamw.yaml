@@ -15,6 +15,7 @@ use_max: False
 weight_decay: 0.01
 batch_size: 4 # number of examples placed on each GPU
 
+accumulation_steps: 1
 # options for mechanic
 mechanize: False
 mech_lambda: 0.01

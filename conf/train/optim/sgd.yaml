@@ -11,6 +11,7 @@ grad_schedule: False
 
 weight_decay: 5e-4
 
+accumulation_steps: 1
 # options for mechanic
 mechanize: False
 mech_lambda: 0.01
