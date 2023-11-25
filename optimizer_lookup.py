@@ -102,9 +102,12 @@ def anytime_avg():
 def flip_sign():
     def init_fn(params):
         return None
+
     def update_fn(updates, state, params):
-        return jtu.tree_map(lambda x : -x, updates), state
+        return jtu.tree_map(lambda x: -x, updates), state
+
     return optax.GradientTransformation(init_fn, update_fn)
+
 
 class ScheduleState(NamedTuple):
     count: jax.Array
@@ -155,7 +158,6 @@ def scale_by_schedule_logged(
 
         return updates, new_state
 
-
     return optax.GradientTransformation(init_fn, update_fn)
 
 
@@ -168,7 +170,7 @@ def schedule_fn(
     peak: float,
     # logger: Optional[Callable] = None,
 ):
-    train_elapsed = train_time/train_duration
+    train_elapsed = train_time / train_duration
     # if train_duration.minutes != float("inf"):
     #     train_elapsed = jnp.asarray(
     #         (timestamp.timestamp / 60 - train_duration.start_time)
@@ -229,13 +231,23 @@ def get_optimizer(
             optax.sgd(learning_rate=1.0, momentum=opt_config.momentum),
         )
     elif opt_config.name == "adamw":
-        optimizer = optax.adamw(learning_rate=1.0, weight_decay=opt_config.weight_decay)
+        optimizer = optax.adamw(
+            learning_rate=1.0,
+            b1=opt_config.beta1,
+            b2=opt_config.beta2,
+            weight_decay=opt_config.weight_decay,
+        )
     elif opt_config.name == "opt_adam":
-        optimizer = optadam.opt_adam(beta1=opt_config.beta1, beta2=opt_config.beta2, weight_decay=opt_config.weight_decay)
+        optimizer = optadam.opt_adam(
+            beta1=opt_config.beta1,
+            beta2=opt_config.beta2,
+            weight_decay=opt_config.weight_decay,
+            use_max=opt_config.use_max
+        )
     elif opt_config.name == "opt_adam_harsh":
         optimizer = optax.chain(
-            optax.add_decayed_weights(weight_decau=opt_config.weight_decay),
-            optadam_harsh.scale_by_opt_laprop(opt_config.beta1, opt_config.beta2)
+            optadam_harsh.scale_by_opt_laprop(opt_config.beta1, opt_config.beta2),
+            optax.add_decayed_weights(weight_decay=opt_config.weight_decay),
         )
 
     if opt_config.bake_schedule:

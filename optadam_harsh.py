@@ -86,7 +86,7 @@ def scale_by_opt_laprop(
     A `GradientTransformation` object.
   """
 
-  mu_dtype = optax._src.utils.utils.canonicalize_dtype(mu_dtype)
+  mu_dtype = optax._src.utils.canonicalize_dtype(mu_dtype)
 
   def init_fn(params):
     mu = jax.tree_util.tree_map(  # First moment

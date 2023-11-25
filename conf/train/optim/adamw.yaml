@@ -7,6 +7,11 @@ lr_decay: linear
 lr: 0.0003
 grad_schedule: False
 
+beta1: 0.9
+beta2: 0.999
+
+use_max: False
+
 weight_decay: 0.01
 batch_size: 4 # number of examples placed on each GPU
 
