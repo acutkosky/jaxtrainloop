@@ -11,6 +11,8 @@ import functools
 import torch
 import logstate
 
+def tree_copy(t):
+    return jtu.tree_map(jnp.copy, t)
 
 def tree_add(a, b):
     return jtu.tree_map(lambda a_i, b_i: a_i + b_i, a, b)

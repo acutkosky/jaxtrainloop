@@ -19,6 +19,7 @@ accumulation_steps: 1
 # options for mechanic
 mechanize: False
 mech_lambda: 0.01
+mech_optimistic: False
 # whether to apply the schedule before mechanic (True) or after mechanic (False)
 bake_schedule: True
 

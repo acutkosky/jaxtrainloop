@@ -381,7 +381,6 @@ def run_epoch(
         for key in summary_metrics:
             if summary_metrics[key] is None:
                 summary_metrics[key] = 0
-            print("adding metric: ", summary_metrics[key]/(it+1))
             log_data[f"{mode}/full_average/{key}"] = summary_metrics[key] / (
                 it + 1
             )

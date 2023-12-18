@@ -15,9 +15,10 @@ class OptAdamState(NamedTuple):
 
 
 def opt_adam(
+    lr: float=1.0,
     beta1: float = 0.9,
     beta2: float = 0.95,
-    weight_decay: float = 0.01,
+    weight_decay: float = 0.0001,
     epsilon: float = 1e-8,
     use_max: bool = False,
 ) -> optax.GradientTransformation:
@@ -31,20 +32,21 @@ def opt_adam(
 
     def update_fn(updates: optax.Updates, state: OptAdamState, params: optax.Params):
 
-        def update_v(v_i, g_i, prev_g_i):
-            result = beta2 * v_i + (1 - beta2) * (g_i - prev_g_i) ** 2
+        def update_v(v_i, g_i, prev_g_i, m_i):
+            result = beta2 * v_i + (1 - beta2) * g_i**2#(g_i - prev_g_i) ** 2
+            # result = beta2 * v_i + (1 - beta2) * (g_i - m_i * jnp.sqrt(v_i)) ** 2
             if use_max:
                 result = jnp.maximum(result, (1 - beta2) * g_i**2)
             return result
 
         next_sum_squared_grad_diff = jtu.tree_map(
-            update_v, state.sum_squared_grad_diff, updates, state.previous_grad
+            update_v, state.sum_squared_grad_diff, updates, state.previous_grad, state.momentum
         )
 
         def update_m(m_i, v_i, prev_v_i, g_i, prev_g_i):
-            result = beta1 * m_i + (1-beta1) * (
-                2 * g_i / (jnp.sqrt(v_i) + epsilon)
-                - prev_g_i / (jnp.sqrt(prev_v_i) + epsilon)
+            result = beta1 * m_i + (1-beta1) * (jnp.abs(m_i) + 1e-8) * (
+                g_i / (jnp.sqrt(v_i) + epsilon)
+                #- prev_g_i / (jnp.sqrt(prev_v_i) + epsilon)
             )
             return result
 
@@ -58,7 +60,7 @@ def opt_adam(
         )
 
         def add_weight_decay(m_i, x_i):
-            return -m_i - x_i * weight_decay
+            return -lr*(m_i - x_i * weight_decay)
 
         next_updates = jtu.tree_map(
             add_weight_decay,

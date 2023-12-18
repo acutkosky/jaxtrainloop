@@ -15,7 +15,8 @@ import logstate
 import util
 import optadam
 import optadam_harsh
-
+import otnc
+import cocob
 
 class NoiseState(NamedTuple):
     key: jax.Array
@@ -113,6 +114,7 @@ class ScheduleState(NamedTuple):
     count: jax.Array
     train_time: duration.TrainTime
     base_state: optax.OptState
+    grad_stats: jax.Array
 
 
 def scale_by_schedule_logged(
@@ -125,7 +127,7 @@ def scale_by_schedule_logged(
         train_time = duration.TrainTime()
         base_state = base_optimizer.init(params)
 
-        state = ScheduleState(count=count, train_time=train_time, base_state=base_state)
+        state = ScheduleState(count=count, train_time=train_time, base_state=base_state, grad_stats=0.0)
         return logstate.LoggedState(state, log_data={"lr/schedule": jnp.array(0.0)})
 
         # logstate.LoggedState((jnp.array(0), duration.JaxTimeStamp()), log_data={"lr/schedule": jnp.array(0.0)})
@@ -135,6 +137,7 @@ def scale_by_schedule_logged(
         count = schedule_state.count
         base_state = schedule_state.base_state
         train_time = schedule_state.train_time
+        grad_stats = schedule_state.grad_stats
 
         count = count + 1
 
@@ -143,7 +146,9 @@ def scale_by_schedule_logged(
         schedule = schedule_fn(count, train_time)
 
         if config.grad_schedule:
-            schedule = schedule / jnp.abs(util.tree_dot(updates, grads))
+            grad_stats = config.grad_stats_beta * grad_stats + (1.0-config.grad_stats_beta) *  jnp.abs(util.tree_dot(updates, grads))
+            schedule = schedule / (grad_stats / (1.0-config.grad_stats_beta**count))
+            # schedule = schedule / jnp.abs(util.tree_dot(updates, grads))
 
         updates = jtu.tree_map(lambda x: schedule * x, updates)
         log_data = {"lr/schedule": schedule}
@@ -152,6 +157,7 @@ def scale_by_schedule_logged(
             count=count,
             train_time=train_time,
             base_state=base_state,
+            grad_stats=grad_stats
         )
 
         new_state = logstate.LoggedState(state=new_state, log_data=log_data)
@@ -244,11 +250,15 @@ def get_optimizer(
             weight_decay=opt_config.weight_decay,
             use_max=opt_config.use_max
         )
+    elif opt_config.name == "cocob":
+        optimizer = cocob.cocob()
     elif opt_config.name == "opt_adam_harsh":
         optimizer = optax.chain(
             optadam_harsh.scale_by_opt_laprop(opt_config.beta1, opt_config.beta2),
             optax.add_decayed_weights(weight_decay=opt_config.weight_decay),
         )
+    elif opt_config.name == "otnc":
+        optimizer = otnc.otnc(opt_config, jax.random.PRNGKey(12345))
 
     if opt_config.bake_schedule:
         optimizer = scale_by_schedule_logged(schedule, optimizer, opt_config)
@@ -264,10 +274,12 @@ def get_optimizer(
             optimizer = optax.contrib.mechanize(
                 optimizer, weight_decay=opt_config.mech_lambda
             )
+        if opt_config.mechanize == "optax_redux":
+            optimizer = new_mechanic.optax_mechanize(optimizer, weight_decay=opt_config.mech_lambda, incremental=opt_config.mech_incremental)
         elif opt_config.mechanize == "new":
-            optimizer = new_mechanic.mechanize(optimizer)
+            optimizer = new_mechanic.mechanize(optimizer, optimistic=opt_config.mech_optimistic, weight_decay=opt_config.mech_lambda, incremental=opt_config.mech_incremental)
         elif opt_config.mechanize == "nobeta":
-            optimizer = new_mechanic.mechanize_no_beta(optimizer)
+            optimizer = new_mechanic.mechanize_no_beta(optimizer, optimistic=opt_config.mech_optimistic, weight_decay=opt_config.mech_lambda, incremental=opt_config.mech_incremental)
         else:
             raise ValueError(f"unknown mechanize option: {opt_config.mechanize}")
         if logger is not None:
@@ -291,9 +303,6 @@ def get_optimizer(
         optimizer = optax.chain(
             add_noise(config.gradient_noise, jax.random.PRNGKey(1231)), optimizer
         )
-    # optimizer = optax.apply_if_finite(optimizer, 15)
-    optimizer = skip_nonfinite(optimizer)
-    # optimizer = optax.chain(optimizer, optax.stateless(zero_if_nan))
 
     if opt_config.accumulation_steps != 1:
         optimizer = optax.MultiSteps(
@@ -303,5 +312,14 @@ def get_optimizer(
             should_skip_update_fn=optax.skip_not_finite,
         )
 
-    opt_state = optimizer.init(jtu.tree_map(jnp.array, eqx.filter(model, eqx.is_array)))
+    if opt_config.get('random_scale_type', 'none') != "none":
+        key = jax.random.PRNGKey(88)
+        optimizer = otnc.random_scale(opt_config.random_scale_type, key, optimizer)
+    
+    
+    # optimizer = optax.apply_if_finite(optimizer, 15)
+    optimizer = skip_nonfinite(optimizer)
+    # optimizer = optax.chain(optimizer, optax.stateless(zero_if_nan))
+
+    opt_state = optimizer.init(util.tree_copy(eqx.filter(model, eqx.is_array)))
     return optimizer, opt_state
