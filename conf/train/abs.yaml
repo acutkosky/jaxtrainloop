@@ -1,5 +1,6 @@
 defaults:
   - optim: sgd
+  - wandb: empty
   - _self_
 
 optim:

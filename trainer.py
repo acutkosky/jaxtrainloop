@@ -58,6 +58,7 @@ class TrainState(NamedTuple):
     dynamic_scaler_state: Optional[DynamicScalerState]
     time: Dict[str, duration.TrainTime]
     aux: Any
+    log_data: logstate.Log
 
 
 def get_dtype(dtype: str):
@@ -76,16 +77,18 @@ def inference_step(
     prng_key: PRNGKeyArray,
     config: Any,
 ):
-    if isinstance(train_state, logstate.LoggedState):
-        train_state = train_state.get_state()
     model = train_state.model.model
     state = train_state.model.state
 
     loss, (state, log_data) = loss_fn(model, state, batch, key=prng_key)
 
-    logged_state = logstate.LoggedState(train_state, log_data)
-    all_logs = util.merge_dicts(*logstate.list_of_logs(logged_state))
-    return loss, logged_state, all_logs
+
+    all_logs = logstate.list_of_logs(state) +  [log_data]
+    all_logs = util.merge_dicts(*all_logs)
+
+    # logged_state = logstate.LoggedState(train_state, log_data)
+    # all_logs = util.merge_dicts(*logstate.list_of_logs(logged_state))
+    return loss, train_state, all_logs
 
 
 def update_avg_tree(tree, avg_tree, count):
@@ -119,8 +122,6 @@ def train_step(
 ):
     print("\ncompiling train step!\n")
 
-    if isinstance(train_state, logstate.LoggedState):
-        train_state = train_state.get_state()
     model = train_state.model.model
     state = train_state.model.state
     opt_state = train_state.optimizer.opt_state
@@ -156,6 +157,11 @@ def train_step(
     if config.averaging == "polyak":
         aux['polyak'] = update_average(model, state, aux['polyak'], time["train"].it + 1)
 
+
+    if config.log_norms:
+        log_data["norms/grads"] = tree_norm(grads)
+        log_data["norms/params"] = tree_norm(model)
+
     new_train_state = TrainState(
         model=ModelAndState(model=model, state=state),
         optimizer=OptimizerAndState(optimizer=optimizer,opt_state=opt_state),
@@ -164,15 +170,12 @@ def train_step(
         # optimizer=optimizer,
         time=time,
         aux=aux,
+        log_data=logstate.Log(log_data),
     )
+    
 
-    if config.log_norms:
-        log_data["norms/grads"] = tree_norm(grads)
-        log_data["norms/params"] = tree_norm(model)
-
-    logged_state = logstate.LoggedState(new_train_state, log_data)
-    all_logs = util.merge_dicts(*logstate.list_of_logs(logged_state))
-    return loss, logged_state, all_logs
+    all_logs = util.merge_dicts(*logstate.list_of_logs(new_train_state))
+    return loss, new_train_state, all_logs
 
 
 
@@ -403,10 +406,10 @@ def train(config: DictConfig, data_loaders=None, model_state=None, optimizer_sta
     if data_loaders is None:
         data_loaders = get_loader(config)
 
-    if config.train.wandb_project is not None:
-        wandb.init(project=config.train.wandb_project)
+    if config.train.wandb.project is not None:
+        wandb.init(project=config.train.wandb.project, tags=config.train.wandb.tags)
         wandb.config.update(OmegaConf.to_container(config))
-        limited_log = RateLimitedLog(wandb.log, config.train.wandb_logs_per_sec)
+        limited_log = RateLimitedLog(wandb.log, config.train.wandb.logs_per_sec)
     else:
         limited_log = None
 
@@ -442,6 +445,7 @@ def train(config: DictConfig, data_loaders=None, model_state=None, optimizer_sta
         dynamic_scaler_state=dynamic_scaler_state,
         time={"train": train_time, "valid": valid_time},
         aux=aux,
+        log_data=logstate.Log({}),
     )
 
     if config.train.get("load_path", False):

@@ -1,6 +1,8 @@
 
 defaults:
   - optim: adamw
+  - wandb: empty
+  - _self_
 
 total_duration: "50000it"
 valid_frequency: "5000it"
@@ -29,6 +31,8 @@ wandb_logs_per_sec: 1.0
 log_norms: True
 
 averaging: none
+averaging_weight: exp_av_inv_grad_l1
+averaging_momentum: False
 
 # this will slow down computation a bit (I believe due to extra GPU/CPU communication),
 # but will log more stuff (like learning rates).

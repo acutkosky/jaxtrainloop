@@ -12,6 +12,7 @@ class OptAdamState(NamedTuple):
     sum_squared_grad_diff: optax.Updates
     momentum: optax.Updates
     previous_grad: optax.Updates
+    count: int
 
 
 def opt_adam(
@@ -27,13 +28,14 @@ def opt_adam(
             sum_squared_grad_diff=jtu.tree_map(jnp.zeros_like, params),
             momentum=jtu.tree_map(jnp.zeros_like, params),
             previous_grad=jtu.tree_map(jnp.zeros_like, params),
+            count=0,
         )
         return state
 
     def update_fn(updates: optax.Updates, state: OptAdamState, params: optax.Params):
 
         def update_v(v_i, g_i, prev_g_i, m_i):
-            result = beta2 * v_i + (1 - beta2) * g_i**2#(g_i - prev_g_i) ** 2
+            result = beta2 * v_i + (1 - beta2) * (g_i - prev_g_i) ** 2
             # result = beta2 * v_i + (1 - beta2) * (g_i - m_i * jnp.sqrt(v_i)) ** 2
             if use_max:
                 result = jnp.maximum(result, (1 - beta2) * g_i**2)
@@ -44,9 +46,9 @@ def opt_adam(
         )
 
         def update_m(m_i, v_i, prev_v_i, g_i, prev_g_i):
-            result = beta1 * m_i + (1-beta1) * (jnp.abs(m_i) + 1e-8) * (
-                g_i / (jnp.sqrt(v_i) + epsilon)
-                #- prev_g_i / (jnp.sqrt(prev_v_i) + epsilon)
+            result = beta1 * m_i + (1-beta1) * jnp.sqrt(1.0 - beta2**(state.count+1)) * (
+                2*g_i / (jnp.sqrt(v_i) + epsilon)
+                - prev_g_i / (jnp.sqrt(prev_v_i) + epsilon)
             )
             return result
 
@@ -72,6 +74,7 @@ def opt_adam(
             sum_squared_grad_diff=next_sum_squared_grad_diff,
             momentum=next_momentum,
             previous_grad=updates,
+            count=state.count+1,
         )
 
         return next_updates, next_state

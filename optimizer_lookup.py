@@ -17,6 +17,7 @@ import optadam
 import optadam_harsh
 import otnc
 import cocob
+from precondition_opt import vector_preconditioned_momentum
 
 class NoiseState(NamedTuple):
     key: jax.Array
@@ -74,28 +75,137 @@ def zero_if_nan(updates, params):
 
 class AnytimeAvgState(NamedTuple):
     iteration: jax.Array
-    momentum: PyTree
+    base_optimizer_state: optax.OptState
+    base_iterate: PyTree
+    total_weight: jax.Array
+    prev_weight: jax.Array
+    weight_state: PyTree
+    av_iterate: jax.Array
+    log_data: logstate.Log
 
 
-def anytime_avg():
+def uniform_weight_fn(grads, state, params, weight_state):
+    return 1.0, None
+
+
+def inv_grad_sq_weight_fn(grads, state, params, weight_state):
+    return 1.0 / (1e-6 + util.tree_norm(grads) ** 2), None
+
+
+def exp_av_inv_grad_sq_weight_init(init, beta):
+    return (init, beta)
+
+def step_count_weight_fn(grads, state, params, weight_state):
+    return weight_state+1, weight_state+1
+
+
+def exp_av_inv_grad_sq_weight_fn(grads, state, params, weight_state):
+    weight, beta = weight_state
+    inv_weight = 1.0 / weight
+    inv_weight = inv_weight * beta + (1 - beta) * util.tree_norm(grads) ** 2
+    weight = 1.0 / inv_weight
+    return weight, (weight, beta)
+
+
+def exp_av_inv_grad_l1_weight_fn(grads, state, params, weight_state):
+    weight, beta = weight_state
+    inv_weight = 1.0 / weight
+    inv_weight = inv_weight * beta + (1 - beta) * util.tree_norm(grads, ord=1)
+    weight = 1.0 / inv_weight
+    return weight, (weight, beta)
+
+
+def anytime_avg(base_optimizer, weight="uniform", averaging_momentum=False):
+    if eqx.is_array_like(weight):
+        weight_fn = lambda grads, state, params: weight, None
+        weight_state = None
+    elif weight == 'step_count':
+        weight_fn = step_count_weight_fn
+        weight_state= 0
+    elif weight == "uniform":
+        weight_fn = uniform_weight_fn
+        weight_state = None
+    elif weight == "inv_grad_sq":
+        weight_fn = inv_grad_sq_weight_fn
+        weight_state = None
+    elif weight == "exp_av_inv_grad_sq":
+        weight_fn = exp_av_inv_grad_sq_weight_fn
+        weight_state = (1e-8, 0.999)
+    elif weight == "exp_av_inv_grad_l1":
+        weight_fn = exp_av_inv_grad_l1_weight_fn
+        weight_state = (1e-8, 0.999)
+    else:
+        weight_fn = weight[0]
+        weight_state = weight[1]
+
     def init_fn(params):
         state = AnytimeAvgState(
-            iteration=jnp.array(0), momentum=jtu.tree_map(jnp.zeros_like, params)
+            iteration=jnp.array(0),
+            base_optimizer_state=base_optimizer.init(params),
+            base_iterate=util.tree_copy(params),
+            av_iterate=util.tree_copy(params),
+            total_weight=1e-8,
+            prev_weight=1e-8,
+            weight_state=weight_state,
+            log_data=logstate.Log(
+                {"averaging/total_weight": 0.0, "averaging/weight": 0.0}
+            ),
         )
         return state
 
-    def update_fn(updates, state, params):
+    def update_fn(grads, state, params):
         iteration = state.iteration + 1
-        beta = (iteration - 1) / (iteration + 1)
-        momentum = jtu.tree_map(
-            lambda m, u: m * beta + u / 2 * (1 - beta), state.momentum, updates
+        base_optimizer_state = state.base_optimizer_state
+        base_iterate = state.base_iterate
+        total_weight = state.total_weight
+        prev_weight = state.prev_weight
+        weight_state = state.weight_state
+        av_iterate = state.av_iterate
+
+        weight, weight_state = weight_fn(grads, state, params, weight_state)
+        # beta = 0.999#jnp.sqrt(0.999)
+        beta = 1.0
+        total_weight = beta * total_weight + weight
+
+        scaled_grads = util.tree_scalar_mul(grads, prev_weight)
+
+        base_update, base_optimizer_state = base_optimizer.update(
+            scaled_grads, base_optimizer_state, params
         )
 
+        base_iterate = optax.apply_updates(base_iterate, base_update)
+
+        av_iterate_update = util.tree_scalar_mul(
+            util.tree_subtract(params, av_iterate), weight / total_weight
+        )
+
+        av_iterate = util.tree_add(av_iterate_update, av_iterate)
+
+        # base_iterate = optax.apply_updates(base_iterate, av_iterate)
+        if averaging_momentum:
+            adjusted_base_iterate = optax.apply_updates(base_iterate, av_iterate)
+        else:
+            adjusted_base_iterate = base_iterate
+
+        updates = util.tree_scalar_mul(
+            util.tree_subtract(adjusted_base_iterate, params), weight / total_weight
+        )
+
+        print("in schedule!")
         state = AnytimeAvgState(
             iteration=iteration,
-            momentum=momentum,
+            base_optimizer_state=base_optimizer_state,
+            base_iterate=base_iterate,
+            total_weight=total_weight,
+            prev_weight=weight,
+            av_iterate=av_iterate,
+            weight_state=weight_state,
+            log_data=logstate.Log(
+                {"averaging/total_weight": total_weight, "averaging/weight": weight}
+            ),
         )
-        return momentum, state
+
+        return updates, state
 
     return optax.GradientTransformation(init_fn, update_fn)
 
@@ -115,6 +225,9 @@ class ScheduleState(NamedTuple):
     train_time: duration.TrainTime
     base_state: optax.OptState
     grad_stats: jax.Array
+    rng_key: jax.Array
+    log_data: logstate.Log
+    prev_update: jax.Array
 
 
 def scale_by_schedule_logged(
@@ -126,41 +239,70 @@ def scale_by_schedule_logged(
         count = jnp.array(0)
         train_time = duration.TrainTime()
         base_state = base_optimizer.init(params)
+        if config.log_inner_product:
+            prev_update = util.zeros_like(params)
+        else:
+            prev_update = None
 
-        state = ScheduleState(count=count, train_time=train_time, base_state=base_state, grad_stats=0.0)
-        return logstate.LoggedState(state, log_data={"lr/schedule": jnp.array(0.0)})
+        state = ScheduleState(
+            count=count,
+            train_time=train_time,
+            base_state=base_state,
+            grad_stats=1.0,
+            rng_key=jax.random.PRNGKey(124323),
+            log_data=logstate.Log(
+                {"lr/schedule": jnp.array(0.0), "lr/innerprod": jnp.array(1.0)}
+            ),
+            prev_update=prev_update,
+        )
+        return state
 
         # logstate.LoggedState((jnp.array(0), duration.JaxTimeStamp()), log_data={"lr/schedule": jnp.array(0.0)})
 
     def update_fn(grads, state, params):
-        schedule_state, log_data = state
-        count = schedule_state.count
-        base_state = schedule_state.base_state
-        train_time = schedule_state.train_time
-        grad_stats = schedule_state.grad_stats
+        count = state.count
+        base_state = state.base_state
+        train_time = state.train_time
+        grad_stats = state.grad_stats
+        prev_update = state.prev_update
 
         count = count + 1
+
+        grads = util.tree_scalar_mul(grads, 1.0 / grad_stats)
 
         updates, base_state = base_optimizer.update(grads, base_state, params)
 
         schedule = schedule_fn(count, train_time)
 
+        rng_key, to_use = jax.random.split(state.rng_key)
+
+        if config.log_inner_product:
+            inner_prod = util.tree_dot(prev_update, grads)
+            next_prev_update = updates
+        else:
+            inner_prod = None
+            next_prev_update = None
         if config.grad_schedule:
-            grad_stats = config.grad_stats_beta * grad_stats + (1.0-config.grad_stats_beta) *  jnp.abs(util.tree_dot(updates, grads))
-            schedule = schedule / (grad_stats / (1.0-config.grad_stats_beta**count))
+            grad_stats = config.grad_stats_beta * grad_stats + (
+                1.0 - config.grad_stats_beta
+            ) * jnp.abs(util.tree_dot(updates, grads))
+            # schedule = schedule / (grad_stats / (1.0-config.grad_stats_beta**count))
             # schedule = schedule / jnp.abs(util.tree_dot(updates, grads))
+        if config.randomize_schedule:
+            schedule = jax.random.exponential(to_use) * schedule
 
         updates = jtu.tree_map(lambda x: schedule * x, updates)
-        log_data = {"lr/schedule": schedule}
+        log_data = {"lr/schedule": schedule, "lr/innerprod": inner_prod}
 
         new_state = ScheduleState(
             count=count,
             train_time=train_time,
             base_state=base_state,
-            grad_stats=grad_stats
+            grad_stats=grad_stats,
+            rng_key=rng_key,
+            log_data=logstate.Log(log_data),
+            prev_update=next_prev_update,
         )
-
-        new_state = logstate.LoggedState(state=new_state, log_data=log_data)
 
         return updates, new_state
 
@@ -196,6 +338,8 @@ def schedule_fn(
         decay_value = fraction_remaining
     elif config.lr_decay == "cosine":
         decay_value = jnp.cos(fraction_remaining * jnp.pi) * 0.5 + 0.5
+    elif config.lr_decay == "sqrt":
+        decay_value = jnp.sqrt(fraction_remaining)
     else:
         decay_value = 1.0
 
@@ -245,10 +389,11 @@ def get_optimizer(
         )
     elif opt_config.name == "opt_adam":
         optimizer = optadam.opt_adam(
+            lr=1.0,
             beta1=opt_config.beta1,
             beta2=opt_config.beta2,
             weight_decay=opt_config.weight_decay,
-            use_max=opt_config.use_max
+            use_max=opt_config.use_max,
         )
     elif opt_config.name == "cocob":
         optimizer = cocob.cocob()
@@ -259,8 +404,19 @@ def get_optimizer(
         )
     elif opt_config.name == "otnc":
         optimizer = otnc.otnc(opt_config, jax.random.PRNGKey(12345))
+    elif opt_config.name == "vector_preconditioned":
+        optimizer = vector_preconditioned_momentum(
+            lr=1.0,
+            beta1=opt_config.beta1,
+            beta2=opt_config.beta2,
+            weight_decay=opt_config.weight_decay,
+        )
 
     if opt_config.bake_schedule:
+        if config.averaging == "anytime":
+            optimizer = anytime_avg(
+                optimizer, config.averaging_weight, config.averaging_momentum
+            )
         optimizer = scale_by_schedule_logged(schedule, optimizer, opt_config)
         # optimizer = optax.chain(optimizer, scale_by_schedule_logged(schedule))
 
@@ -269,35 +425,74 @@ def get_optimizer(
         grad_clip = optax.clip_by_global_norm(opt_config.gradient_clip_val)
         optimizer = optax.chain(grad_clip, optimizer)
 
-    if opt_config.mechanize:
+    if opt_config.mechanize and opt_config.mechanize != 'none':
         if opt_config.mechanize == "optax":
             optimizer = optax.contrib.mechanize(
-                optimizer, weight_decay=opt_config.mech_lambda
+                optimizer, weight_decay=opt_config.mechanic.weight_decay
             )
-        if opt_config.mechanize == "optax_redux":
-            optimizer = new_mechanic.optax_mechanize(optimizer, weight_decay=opt_config.mech_lambda, incremental=opt_config.mech_incremental)
+        elif opt_config.mechanize == "optax_redux":
+            optimizer = new_mechanic.optax_mechanize(
+                optimizer,
+                weight_decay=opt_config.mechanic.weight_decay,
+                incremental=opt_config.mechanic.incremental,
+                randomize_incremental=opt_config.mechanic.randomize_incremental,
+                use_incremental_variation=opt_config.mechanic.use_incremental_variation,
+                averaging_momentum=opt_config.mechanic.averaging_momentum,
+                freeze_s_iteration=opt_config.mechanic.freeze_s_iteration,
+                randomize_after_freeze=opt_config.mechanic.randomize_after_freeze,
+                betas=opt_config.mechanic.optax.betas,
+                betas2=opt_config.mechanic.optax.betas2,
+                num_iter=opt_config.mechanic.optax.num_iter,
+            )
         elif opt_config.mechanize == "new":
-            optimizer = new_mechanic.mechanize(optimizer, optimistic=opt_config.mech_optimistic, weight_decay=opt_config.mech_lambda, incremental=opt_config.mech_incremental)
-        elif opt_config.mechanize == "nobeta":
-            optimizer = new_mechanic.mechanize_no_beta(optimizer, optimistic=opt_config.mech_optimistic, weight_decay=opt_config.mech_lambda, incremental=opt_config.mech_incremental)
+            betas = [0.9, 0.99, 0.999, 0.9999, 0.99999, 0.999999]
+            if opt_config.mechanic.use_one_beta:
+                betas = [1.0] + betas
+            optimizer = new_mechanic.mechanize(
+                optimizer,
+                betas=betas,
+                optimistic=opt_config.mechanic.optimistic,
+                weight_decay=opt_config.mechanic.weight_decay,
+                incremental=opt_config.mechanic.incremental,
+                randomize_incremental=opt_config.mechanic.randomize_incremental,
+                per_layer=opt_config.mechanic.per_layer,
+                max_tuner_output=opt_config.mechanic.max_tuner_output,
+                use_incremental_variation=opt_config.mechanic.use_incremental_variation,
+                freeze_s_iteration=opt_config.mechanic.freeze_s_iteration,
+                randomize_after_freeze=opt_config.mechanic.randomize_after_freeze,
+            )
+        elif opt_config.mechanize == "singlebeta":
+            optimizer = new_mechanic.mechanize_single_beta(
+                optimizer,
+                optimistic=opt_config.mechanic.optimistic,
+                weight_decay=opt_config.mechanic.weight_decay,
+                incremental=opt_config.mechanic.incremental,
+                randomize_incremental=opt_config.mechanic.randomize_incremental,
+                per_layer=opt_config.mechanic.per_layer,
+                beta=opt_config.mechanic.single_beta_val,
+                max_tuner_output=opt_config.mechanic.max_tuner_output,
+                use_incremental_variation=opt_config.mechanic.use_incremental_variation,
+                freeze_s_iteration=opt_config.mechanic.freeze_s_iteration,
+                randomize_after_freeze=opt_config.mechanic.randomize_after_freeze,
+            )
         else:
             raise ValueError(f"unknown mechanize option: {opt_config.mechanize}")
         if logger is not None:
 
             def log_fn(updates, state, params):
-                return {"mechanic/s": jnp.sum(state.s)}
+                return {"mechanic/s": util.tree_reduce_mean(state.s)}
 
             optimizer = log_optax(optimizer, log_fn)
 
     if not opt_config.bake_schedule:
+        if config.averaging == "anytime":
+            optimizer = anytime_avg(
+                optimizer, config.averaging_weight, config.averaging_momentum
+            )
         # optimizer = optax.chain(optimizer,
         optimizer = scale_by_schedule_logged(schedule, optimizer, opt_config)
         # if not opt_config.mechanize:
         #     optimizer = optax.chain(optimizer, optax.scale(opt_config.lr))
-
-
-    if config.averaging == "anytime":
-        optimizer = optax.chain(optimizer, anytime_avg())
 
     if config.get("gradient_noise", 0) != 0:
         optimizer = optax.chain(
@@ -312,11 +507,10 @@ def get_optimizer(
             should_skip_update_fn=optax.skip_not_finite,
         )
 
-    if opt_config.get('random_scale_type', 'none') != "none":
+    if opt_config.get("random_scale_type", "none") != "none":
         key = jax.random.PRNGKey(88)
         optimizer = otnc.random_scale(opt_config.random_scale_type, key, optimizer)
-    
-    
+
     # optimizer = optax.apply_if_finite(optimizer, 15)
     optimizer = skip_nonfinite(optimizer)
     # optimizer = optax.chain(optimizer, optax.stateless(zero_if_nan))

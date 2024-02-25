@@ -17,6 +17,14 @@ def tree_copy(t):
 def tree_add(a, b):
     return jtu.tree_map(lambda a_i, b_i: a_i + b_i, a, b)
 
+def tree_reduce_mean(t):
+    total = jtu.tree_reduce(
+        lambda x, y : x+y,
+        jtu.tree_map(jnp.sum, t)
+    )
+    count = len(jtu.tree_leaves(jtu.tree_map(lambda x: x.size, t)))
+    return total/count
+
 
 def tree_subtract(a, b):
     return jtu.tree_map(lambda a_i, b_i: a_i - b_i, a, b)
@@ -24,6 +32,9 @@ def tree_subtract(a, b):
 
 def tree_dot_per_layer(v, w):
     return jtu.tree_map(lambda vi, wi: jnp.sum(vi * wi), v, w)
+
+def tree_scalar_mul(t, m):
+    return jtu.tree_map(lambda t_i: t_i * m, t)
 
 
 def tree_dot(v, w):
@@ -84,13 +95,18 @@ def tree_dot_per_layer(v, w):
 def tree_dot(v, w):
     return jtu.tree_reduce(lambda x, y: x + y, tree_dot_per_layer(v, w))
 
-def tree_norm(tree):
-    return jnp.sqrt(
+def tree_norm(tree, ord=2):
+    if ord == 'infty':
+        return jtu.tree_reduce(
+            lambda x,y: jnp.maximum(x,y),
+            jtu.tree_map(lambda x: jnp.max(jnp.abs(x)), eqx.filter(tree, eqx.is_array))
+        )
+    return (
         jtu.tree_reduce(
             lambda x, y: x + y,
-            jtu.tree_map(lambda x: jnp.sum(x * x), eqx.filter(tree, eqx.is_array)),
+            jtu.tree_map(lambda x: jnp.sum(jnp.abs(x)**ord), eqx.filter(tree, eqx.is_array)),
         )
-    )
+    )**(1.0/ord)
 
 
 
@@ -109,14 +125,14 @@ def log_optax(base_optimizer, log_fn, pruned=False):
         if pruned:
             return state
         log_data = log_fn(zeros_like(params), state, params)
-        return logstate.LoggedState(state, log_data)
+        return (state, logstate.Log(log_data))
 
     def update_fn(updates, state, params):
         if not pruned:
-            state, log_data = state
+            state, _ = state
         log_data = log_fn(updates, state, params)
         updates, state = base_optimizer.update(updates, state, params)
-        state = logstate.LoggedState(state, log_data)
+        state = (state, logstate.Log(log_data))
         return updates, state
 
     return GradientTransformation(init_fn, update_fn)

@@ -1,5 +1,7 @@
 defaults:
   - optim: sgd
+  - wandb: empty
+  - _self_
 
 total_duration: "200ep"
 valid_frequency: "1ep"

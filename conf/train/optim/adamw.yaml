@@ -18,8 +18,43 @@ batch_size: 4 # number of examples placed on each GPU
 accumulation_steps: 1
 # options for mechanic
 mechanize: False
-mech_lambda: 0.01
-mech_optimistic: False
+mechanic:
+  weight_decay: 0.01
+  optimistic: False
+  incremental: False
+  randomize_incremental: False
+  per_layer: False
+  use_one_beta: False
+  single_beta_val: 1.0
+  max_tuner_output: null
+  use_incremental_variation: False
+  averaging_momentum: 0.0
+  freeze_s_iteration: null
+  randomize_after_freeze: False
+  optax:
+    betas2: null
+    betas: [0.9, 0.99, 0.999, 0.9999, 0.99999, 0.999999]
+    num_iter: 50000
+  
+
+random_scale_type: none
+base_opt: capped_cb
+update_type: diag_sum
+max_bet: 0.1
+cb_eps: 1e-6
+cb_var_eps: 0.0
+cb_reward_beta: 1.0
+cb_use_dim: False
+cb_grad_norm_type: l2
+cb_clip_bet_fraction: False
+cb_s_decay: False
+cb_do_project_reduction: False
+cb_do_log_wealth_grad: False
+grad_stats_beta: 0.999
+randomize_schedule: False
+log_inner_product: True
+cap: 1e-2
+
 # whether to apply the schedule before mechanic (True) or after mechanic (False)
 bake_schedule: True
 

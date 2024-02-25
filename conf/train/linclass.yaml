@@ -1,5 +1,6 @@
 defaults:
-  - optim: sgd
+  - optim: adamw
+  - wandb: empty
   - _self_
 
 optim:
@@ -25,6 +26,8 @@ test_key: "test"
 loss_fn: tuple_classification
 
 averaging: 'none'
+averaging_weight: exp_av_inv_grad_l1
+averaging_momentum: False
 
 
 batch_size: 32 # number of examples placed on each GPU
@@ -47,6 +50,7 @@ log_callback_data: True
 
 
 dataloader_workers: 2
+
   
 
 
