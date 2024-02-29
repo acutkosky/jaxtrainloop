@@ -4,7 +4,7 @@ import jax
 from jax import numpy as jnp
 from jax import tree_util as jtu
 from jax import numpy
-from typing import NamedTuple, Any, Optional, List, Tuple
+from typing import NamedTuple, Any, Optional, List, Tuple, Union
 from optax import tree_utils as optu
 import util
 import otnc
@@ -41,13 +41,39 @@ class OptaxTunerState(NamedTuple):
     reward: PyTree
     s_init: PyTree
     max_grad: PyTree
+    sum_grad: PyTree
     sum_squared_grad: PyTree
     iter_count: PyTree
 
 
 def optax_tuner(
-    beta=1.0, eps=1e-8, num_iter=None, beta2=None, square_bet_fraction=False
+    beta=1.0, eps=1e-8, num_iter=Union[None, int, str], beta2=None, bet_fraction_type='sqrt'
 ):
+    '''
+    implements the tuner as in the original mechanic implementation in optax, with a  
+    few new options.
+    
+    beta: beta value for decaying the reward.
+    beta2: beta value for decaying the second order stats (if None, will be beta**2)
+    eps: for numerical precision
+    num_iter: 
+        If this is None, is ignore.
+    
+        If a number, then instead of having the betting fraction be
+        1/sqrt(v), we do 1/sqrt(v*(1-beta2)/(1-beta2**current_iter)  * num_iter)
+        That is, we compute the debiased average v*(1-beta2)/(1-beta2**current_iter), and then
+        rescale this by the number of iterations that we think are going to happen.
+
+        If a string, it must be equal to 'anytime'.
+        This will behave the same as if it is a number, but we will use current_iter as the guess
+        for the number of iterations.
+    bet_fraction_type:
+        whether to use the original betting fraction ('sqrt')
+        or a theoreically maybe-better one ('ftrl')
+
+    '''      
+
+    
     if beta2 is None:
         beta2 = beta**2
 
@@ -57,6 +83,7 @@ def optax_tuner(
             s_init=util.tree_copy(s_init),
             max_grad=optu.tree_zeros_like(s_init),
             sum_squared_grad=optu.tree_zeros_like(s_init),
+            sum_grad=optu.tree_zeros_like(s_init),
             iter_count=0,
         )
         return state
@@ -76,12 +103,23 @@ def optax_tuner(
             next_sum_squared_grad = jtu.tree_map(
                 lambda v_i, g_i: beta2 * v_i + g_i**2, state.sum_squared_grad, grads
             )
+            next_sum_grad = jtu.tree_map(
+                lambda m_i, g_i: beta * m_i + g_i, state.sum_grad, grads
+            )
+            debiased_next_sum_grad = next_sum_grad
             debiased_next_sum_squared_grad = next_sum_squared_grad
         else:
             next_sum_squared_grad = jtu.tree_map(
                 lambda v_i, g_i: beta2 * v_i + (1 - beta2) * g_i**2,
                 state.sum_squared_grad,
                 grads,
+            )
+            next_sum_grad = jtu.tree_map(
+                lambda m_i, g_i: beta * m_i + (1-beta) * g_i, state.sum_grad, grads
+            )
+            debiased_next_sum_grad = jtu.tree_map(
+                lambda m_i: m_i / (1.0 - beta**next_iter_count),
+                next_sum_grad,
             )
             debiased_next_sum_squared_grad = jtu.tree_map(
                 lambda v_i: v_i / (1.0 - beta2**next_iter_count),
@@ -104,6 +142,7 @@ def optax_tuner(
         #     m=state.max_grad,
         # )
 
+
         wealth = jtu.tree_map(
             lambda s_init_i, m_i, r_i: s_init_i * m_i + jnp.clip(r_i, 0),
             state.s_init,
@@ -120,15 +159,23 @@ def optax_tuner(
         else:
             beta_scaling = 1.0 / jnp.sqrt(num_iter)
 
-        if square_bet_fraction:
-            bet_fraction_power = 2
-        else:
-            bet_fraction_power = 1
 
+        if bet_fraction_type == 'ftrl':
+            bet_fraction = jtu.tree_map(
+                lambda m_i, v_i: jnp.max(-m_i, 0)/(v_i*beta_scaling + eps),
+                debiased_next_sum_grad,
+                debiased_next_sum_squared_grad
+            )
+        elif bet_fraction_type == 'sqrt':
+            bet_fraction = jtu.tree_map(
+                lambda v_i: 1.0/(jnp.sqrt(v_i) * beta_scaling + eps),
+                debiased_next_sum_squared_grad
+            )
+        
         next_s = jtu.tree_map(
-            lambda w, v: w / ((jnp.sqrt(v) * beta_scaling) ** bet_fraction_power + eps),
+            lambda w_i, b_i: w_i * b_i,
             wealth,
-            debiased_next_sum_squared_grad,
+            bet_fraction
         )
 
         next_state = OptaxTunerState(
@@ -136,6 +183,7 @@ def optax_tuner(
             s_init=state.s_init,
             max_grad=next_max_grad,
             sum_squared_grad=next_sum_squared_grad,
+            sum_grad=next_sum_grad,
             iter_count=next_iter_count,
         )
 
@@ -198,12 +246,12 @@ class MechanicState(NamedTuple):
 
 
 def summed_optax_tuner(
-    betas=[0.9, 0.99, 0.999, 0.9999, 0.99999, 0.999999], num_iter=None, betas2=None
+    betas=[0.9, 0.99, 0.999, 0.9999, 0.99999, 0.999999], num_iter=None, betas2=None, **kwargs
 ):
     if betas2 is None:
         betas2 = [None for b in betas]
     tuners = [
-        optax_tuner(beta=beta, num_iter=num_iter, beta2=beta2)
+        optax_tuner(beta=beta, num_iter=num_iter, beta2=beta2, **kwargs)
         for beta, beta2 in zip(betas, betas2)
     ]
     return add_optimizers(tuners)
@@ -214,25 +262,35 @@ def optax_like_mechanize(
     s_init: float = 1e-8,
     betas: List[float] = [0.9, 0.99, 0.999, 0.9999, 0.99999, 0.999999],
     weight_decay: float = 0.0,
-    incremental: bool = False,
-    randomize_incremental: bool = False,
-    use_incremental_variation: bool = False,
     betas2=None,
     num_iter=None,
+    bet_fraction_type='sqrt',
     **kwargs
 ) -> optax.GradientTransformation:
     """
     re-implement the original mechanic in optax using this framework.
+
+    s_init:
+        initial s value
+    betas:
+        list of  betas for the tuner
+    weight_decay:
+        the weight decay (lambda) value
+    betas2:
+        beta2 values for the tuner (it's a newer feature, see tuner doc string - set to None to use defaults)
+    num_iter:
+        total number of iterations for use by the tuner. Set to None to recover original behavior  (see tuner
+        docstring)
+    bet_fraction_type:
+        argument for tuner, see tuner docstring.
+    
     """
-    tuner = summed_optax_tuner(betas, num_iter, betas2=betas2)
+    tuner = summed_optax_tuner(betas, num_iter, betas2=betas2, bet_fraction_type=bet_fraction_type)
     return mechanize(
         base_optimizer,
         tuner_optimizer=tuner,
         s_init=s_init / len(betas),
         weight_decay=weight_decay,
-        incremental=incremental,
-        randomize_incremental=randomize_incremental,
-        use_incremental_variation=use_incremental_variation,
         **kwargs
     )
 
@@ -301,7 +359,6 @@ def mechanize(
                     "reward_std": 0.0,
                     "mechanic/max_s": 0.0,
                     "mechanic/min_s": 0.0,
-                    "mechanic/tuner_update_count": 0,
                     "mechanic/offset_norm": 0.0,
                     "mechanic/scaled_offset_norm": 0.0,
                 }

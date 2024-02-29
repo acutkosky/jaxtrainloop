@@ -19,6 +19,7 @@ import otnc
 import cocob
 from precondition_opt import vector_preconditioned_momentum
 import exponential_balancer
+import simplified_mechanic
 
 
 class NoiseState(NamedTuple):
@@ -498,7 +499,20 @@ def get_optimizer(
                 betas=opt_config.mechanic.optax.betas,
                 betas2=opt_config.mechanic.optax.betas2,
                 num_iter=opt_config.mechanic.optax.num_iter,
-                square_bet_fraction=opt_config.mechanic.optax.square_bet_fraction,
+                bet_fraction_type=opt_config.mechanic.optax.bet_fraction_type,
+                per_layer=opt_config.mechanic.per_layer,
+                tuner_decay_schedule=opt_config.mechanic.tuner_decay_schedule,
+            )
+        elif opt_config.mechanize == "simplified_mechanic":
+            optimizer = simplified_mechanic.optax_like_mechanize(
+                optimizer,
+                weight_decay=opt_config.mechanic.weight_decay,
+                averaging_momentum=opt_config.mechanic.averaging_momentum,
+                freeze_s_iteration=opt_config.mechanic.freeze_s_iteration,
+                betas=opt_config.mechanic.optax.betas,
+                betas2=opt_config.mechanic.optax.betas2,
+                num_iter=opt_config.mechanic.optax.num_iter,
+                bet_fraction_type=opt_config.mechanic.optax.bet_fraction_type,
                 per_layer=opt_config.mechanic.per_layer,
                 tuner_decay_schedule=opt_config.mechanic.tuner_decay_schedule,
             )
