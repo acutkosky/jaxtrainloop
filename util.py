@@ -11,19 +11,40 @@ import functools
 import torch
 import logstate
 
+
+def tree_reduce_sum(t):
+    return jnp.sum(
+        jnp.array(
+            jtu.tree_leaves(jtu.tree_map(jnp.sum, t))
+        )
+    )
+
+def map_over_lists(func, *ls):
+    return jtu.tree_map(func, *ls, is_leaf=lambda x: x not in ls)
+
+
+def tree_sq_norm(t):
+    return jtu.tree_reduce(
+        lambda x, y: x + y, jtu.tree_map(lambda p: jnp.sum(p**2), t)
+    )
+
+
+def tree_norm(t):
+    return jnp.sqrt(tree_sq_norm(t))
+
+
 def tree_copy(t):
     return jtu.tree_map(jnp.copy, t)
+
 
 def tree_add(a, b):
     return jtu.tree_map(lambda a_i, b_i: a_i + b_i, a, b)
 
+
 def tree_reduce_mean(t):
-    total = jtu.tree_reduce(
-        lambda x, y : x+y,
-        jtu.tree_map(jnp.sum, t)
-    )
+    total = jtu.tree_reduce(lambda x, y: x + y, jtu.tree_map(jnp.sum, t))
     count = len(jtu.tree_leaves(jtu.tree_map(lambda x: x.size, t)))
-    return total/count
+    return total / count
 
 
 def tree_subtract(a, b):
@@ -32,6 +53,7 @@ def tree_subtract(a, b):
 
 def tree_dot_per_layer(v, w):
     return jtu.tree_map(lambda vi, wi: jnp.sum(vi * wi), v, w)
+
 
 def tree_scalar_mul(t, m):
     return jtu.tree_map(lambda t_i: t_i * m, t)
@@ -88,6 +110,7 @@ def reduce_state(state, new_state, reduce_fn=lambda x: jnp.mean(x, axis=0)):
 def zeros_like(tree: PyTree) -> PyTree:
     return jtu.tree_map(jnp.zeros_like, tree)
 
+
 def tree_dot_per_layer(v, w):
     return jtu.tree_map(lambda vi, wi: jnp.sum(vi * wi), v, w)
 
@@ -95,20 +118,21 @@ def tree_dot_per_layer(v, w):
 def tree_dot(v, w):
     return jtu.tree_reduce(lambda x, y: x + y, tree_dot_per_layer(v, w))
 
+
 def tree_norm(tree, ord=2):
-    if ord == 'infty':
+    if ord == "infty":
         return jtu.tree_reduce(
-            lambda x,y: jnp.maximum(x,y),
-            jtu.tree_map(lambda x: jnp.max(jnp.abs(x)), eqx.filter(tree, eqx.is_array))
+            lambda x, y: jnp.maximum(x, y),
+            jtu.tree_map(lambda x: jnp.max(jnp.abs(x)), eqx.filter(tree, eqx.is_array)),
         )
     return (
         jtu.tree_reduce(
             lambda x, y: x + y,
-            jtu.tree_map(lambda x: jnp.sum(jnp.abs(x)**ord), eqx.filter(tree, eqx.is_array)),
+            jtu.tree_map(
+                lambda x: jnp.sum(jnp.abs(x) ** ord), eqx.filter(tree, eqx.is_array)
+            ),
         )
-    )**(1.0/ord)
-
-
+    ) ** (1.0 / ord)
 
 
 def merge_dicts(*to_merge):

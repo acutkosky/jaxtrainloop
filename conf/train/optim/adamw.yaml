@@ -16,6 +16,17 @@ weight_decay: 0.01
 batch_size: 4 # number of examples placed on each GPU
 
 accumulation_steps: 1
+
+# options for exponential balancer
+do_exp_balancing: False
+exp_balancing:
+  beta1: 1.0
+  beta2: 1.0
+  s_init: 1e-8
+  exp_scaling: 1.0
+  granularity: 'global'
+  exp_type: 'standard'
+
 # options for mechanic
 mechanize: False
 mechanic:
@@ -31,10 +42,12 @@ mechanic:
   averaging_momentum: 0.0
   freeze_s_iteration: null
   randomize_after_freeze: False
+  tuner_decay_schedule: constant
   optax:
     betas2: null
     betas: [0.9, 0.99, 0.999, 0.9999, 0.99999, 0.999999]
     num_iter: 50000
+    square_bet_fraction: false
   
 
 random_scale_type: none

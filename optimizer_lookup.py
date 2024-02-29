@@ -18,6 +18,8 @@ import optadam_harsh
 import otnc
 import cocob
 from precondition_opt import vector_preconditioned_momentum
+import exponential_balancer
+
 
 class NoiseState(NamedTuple):
     key: jax.Array
@@ -52,18 +54,25 @@ def all_finite(tree: PyTree) -> jax.Array:
 
 def skip_nonfinite(opt: optax.GradientTransformation) -> optax.GradientTransformation:
     def init_fn(params: optax.Params):
-        return opt.init(params)
+        return (opt.init(params), 0, logstate.Log({"optimizer/skipped_steps": 0}))
 
     def update_fn(
         updates: optax.Updates,
         state: optax.OptState,
         params: Optional[optax.Params] = None,
     ):
-        next_updates, next_state = opt.update(updates, state, params)
-        return jax.lax.cond(
-            all_finite((next_updates, next_state)),
-            lambda: (next_updates, next_state),
-            lambda: (zeros_like(updates), state),
+        inner_state, skip_count, logs = state
+        next_updates, next_inner_state = opt.update(updates, inner_state, params)
+        next_updates, next_inner_state, next_skip_count = jax.lax.cond(
+            all_finite((next_updates, next_inner_state)),
+            lambda: (next_updates, next_inner_state, skip_count),
+            lambda: (zeros_like(updates), inner_state, skip_count + 1),
+        )
+
+        return next_updates, (
+            next_inner_state,
+            next_skip_count,
+            logstate.Log({"optimizer/skipped_steps": next_skip_count}),
         )
 
     return optax.GradientTransformation(init_fn, update_fn)
@@ -95,8 +104,9 @@ def inv_grad_sq_weight_fn(grads, state, params, weight_state):
 def exp_av_inv_grad_sq_weight_init(init, beta):
     return (init, beta)
 
+
 def step_count_weight_fn(grads, state, params, weight_state):
-    return weight_state+1, weight_state+1
+    return weight_state + 1, weight_state + 1
 
 
 def exp_av_inv_grad_sq_weight_fn(grads, state, params, weight_state):
@@ -119,9 +129,9 @@ def anytime_avg(base_optimizer, weight="uniform", averaging_momentum=False):
     if eqx.is_array_like(weight):
         weight_fn = lambda grads, state, params: weight, None
         weight_state = None
-    elif weight == 'step_count':
+    elif weight == "step_count":
         weight_fn = step_count_weight_fn
-        weight_state= 0
+        weight_state = 0
     elif weight == "uniform":
         weight_fn = uniform_weight_fn
         weight_state = None
@@ -216,6 +226,40 @@ def flip_sign():
 
     def update_fn(updates, state, params):
         return jtu.tree_map(lambda x: -x, updates), state
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
+class RunningStdDevState(NamedTuple):
+    param_mean: PyTree
+    variance: float
+    log_data: logstate.Log
+
+
+def record_running_std_dev(beta):
+    def init_fn(params):
+        return RunningStdDevState(
+            param_mean=util.tree_copy(params),
+            variance=0.0,
+            log_data=logstate.Log({f"param_variance_@{beta}": 0.0}),
+        )
+
+    def update_fn(updates, state, params):
+        next_param_mean = jtu.tree_map(
+            lambda m_i, p_i: beta * m_i + (1 - beta) * p_i, state.param_mean, params
+        )
+
+        next_variance = beta * state.variance + util.tree_sq_norm(
+            util.tree_subtract(params, state.param_mean)
+        )
+
+        next_state = RunningStdDevState(
+            param_mean=next_param_mean,
+            variance=next_variance,
+            log_data=logstate.Log({f"param_variance_@{beta}": jnp.sqrt(next_variance)}),
+        )
+
+        return updates, next_state
 
     return optax.GradientTransformation(init_fn, update_fn)
 
@@ -425,13 +469,24 @@ def get_optimizer(
         grad_clip = optax.clip_by_global_norm(opt_config.gradient_clip_val)
         optimizer = optax.chain(grad_clip, optimizer)
 
-    if opt_config.mechanize and opt_config.mechanize != 'none':
+    if opt_config.do_exp_balancing:
+        scalar = exponential_balancer.exponential_balancer(
+            beta1=opt_config.exp_balancing.beta1,
+            beta2=opt_config.exp_balancing.beta2,
+            s_init=opt_config.exp_balancing.s_init,
+            granularity=opt_config.exp_balancing.granularity,
+            exp_type=opt_config.exp_balancing.exp_type,
+            exp_scaling=opt_config.exp_balancing.exp_scaling,
+        )
+        optimizer = optax.chain(optimizer, scalar)
+
+    if opt_config.mechanize and opt_config.mechanize != "none":
         if opt_config.mechanize == "optax":
             optimizer = optax.contrib.mechanize(
                 optimizer, weight_decay=opt_config.mechanic.weight_decay
             )
         elif opt_config.mechanize == "optax_redux":
-            optimizer = new_mechanic.optax_mechanize(
+            optimizer = new_mechanic.optax_like_mechanize(
                 optimizer,
                 weight_decay=opt_config.mechanic.weight_decay,
                 incremental=opt_config.mechanic.incremental,
@@ -443,6 +498,9 @@ def get_optimizer(
                 betas=opt_config.mechanic.optax.betas,
                 betas2=opt_config.mechanic.optax.betas2,
                 num_iter=opt_config.mechanic.optax.num_iter,
+                square_bet_fraction=opt_config.mechanic.optax.square_bet_fraction,
+                per_layer=opt_config.mechanic.per_layer,
+                tuner_decay_schedule=opt_config.mechanic.tuner_decay_schedule,
             )
         elif opt_config.mechanize == "new":
             betas = [0.9, 0.99, 0.999, 0.9999, 0.99999, 0.999999]
@@ -460,6 +518,7 @@ def get_optimizer(
                 use_incremental_variation=opt_config.mechanic.use_incremental_variation,
                 freeze_s_iteration=opt_config.mechanic.freeze_s_iteration,
                 randomize_after_freeze=opt_config.mechanic.randomize_after_freeze,
+                tuner_decay_schedule=opt_config.mechanic.tuner_decay_schedule,
             )
         elif opt_config.mechanize == "singlebeta":
             optimizer = new_mechanic.mechanize_single_beta(
@@ -474,6 +533,7 @@ def get_optimizer(
                 use_incremental_variation=opt_config.mechanic.use_incremental_variation,
                 freeze_s_iteration=opt_config.mechanic.freeze_s_iteration,
                 randomize_after_freeze=opt_config.mechanic.randomize_after_freeze,
+                tuner_decay_schedule=opt_config.mechanic.tuner_decay_schedule,
             )
         else:
             raise ValueError(f"unknown mechanize option: {opt_config.mechanize}")

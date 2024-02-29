@@ -10,6 +10,7 @@ import util
 import otnc
 import logstate
 
+
 def tree_add(a, b):
     return jtu.tree_map(lambda a_i, b_i: a_i + b_i, a, b)
 
@@ -47,7 +48,7 @@ def mirror_descent_tuner(
     beta: float = 1.0,
     epsilon: float = 1e-8,
     small_value: float = 1e-6,
-    max_tuner_output: float =None,
+    max_tuner_output: float = None,
 ):
     def init_fn(params: optax.Params):
         state = MirrorDescentTunerState(
@@ -82,7 +83,6 @@ def mirror_descent_tuner(
             V = V + small_value
             M = M + small_value
             return jnp.log(p / init_i) * jnp.sqrt(V)
-
 
         def get_next_param(p_i, init_i, u_i, old_sum_i, next_sum_i, m_i):
             old_theta = inv_link_fn(p_i, next_sum_i, m_i, init_i)
@@ -203,10 +203,10 @@ class OptaxTunerState(NamedTuple):
     iter_count: PyTree
 
 
-def optax_tuner(beta=1.0, eps=1e-8, num_iter=None, beta2=None):
+def optax_tuner(beta=1.0, eps=1e-8, num_iter=None, beta2=None, square_bet_fraction=False):
     if beta2 is None:
         beta2 = beta**2
-        
+
     def init_fn(s_init: PyTree):
         state = OptaxTunerState(
             reward=optu.tree_zeros_like(s_init),
@@ -234,11 +234,15 @@ def optax_tuner(beta=1.0, eps=1e-8, num_iter=None, beta2=None):
             )
             debiased_next_sum_squared_grad = next_sum_squared_grad
         else:
-            
             next_sum_squared_grad = jtu.tree_map(
-                lambda v_i, g_i: beta2 * v_i + (1-beta2) * g_i**2, state.sum_squared_grad, grads
+                lambda v_i, g_i: beta2 * v_i + (1 - beta2) * g_i**2,
+                state.sum_squared_grad,
+                grads,
             )
-            debiased_next_sum_squared_grad = next_sum_squared_grad/(1.0-beta2**next_iter_count)
+            debiased_next_sum_squared_grad = jtu.tree_map(
+                lambda v_i: v_i / (1.0 - beta2**next_iter_count),
+                next_sum_squared_grad,
+            )
 
         next_reward = jtu.tree_map(
             lambda r_i, s_i, g_i: beta * r_i - g_i * s_i,
@@ -263,18 +267,22 @@ def optax_tuner(beta=1.0, eps=1e-8, num_iter=None, beta2=None):
             next_reward,
         )
 
-        
         if num_iter is None:
             beta_scaling = 1.0
-        elif num_iter == 'anytime':
-            beta_scaling = 1.0/jnp.sqrt(next_iter_count)
-        elif num_iter == 'usebeta':
-            beta_scaling = jnp.sqrt(1-beta2)
+        elif num_iter == "anytime":
+            beta_scaling = 1.0 / jnp.sqrt(next_iter_count)
+        elif num_iter == "usebeta":
+            beta_scaling = jnp.sqrt(1 - beta2)
         else:
-            beta_scaling = 1.0/jnp.sqrt(num_iter)
+            beta_scaling = 1.0 / jnp.sqrt(num_iter)
+
+        if square_bet_fraction:
+            bet_fraction_power = 2
+        else:
+            bet_fraction_power = 1
 
         next_s = jtu.tree_map(
-            lambda w, v: w / (jnp.sqrt(v) + eps) * beta_scaling,
+            lambda w, v: w / ((jnp.sqrt(v) * beta_scaling) ** bet_fraction_power + eps),
             wealth,
             debiased_next_sum_squared_grad,
         )
@@ -319,20 +327,45 @@ def add_optimizers(optimizers: Tuple[optax.GradientTransformation]):
             for opt, s, p in zip(optimizers, substates, subparams)
         ]
 
+        # updates__state = util.map_over_lists(
+        #     lambda o, s, p: o.update(updates, s, p),
+        #     optimizers,
+        #     substates,
+        #     subparams
+        # )
+        # next_substates = util.map_over_lists(
+        #     lambda x: x[1],
+        #     updates__state
+        # )
+        # next_subparams = jtu.tree_map(
+        #     lambda sp, u_s: optax.apply_updates(sp, u_s[0]),
+        #     supbarams,
+        #     updates__state
+        # )
+        # subupdates = [u__s[0] for u__s in updates__state]
+        # updates = jtu.tree_map(
+        #     lambda *u_i: jnp.sum(jnp.array(u_i), axis=0) / len(updates__state),
+        #     *subupdates #*[u__s[0] for u__s in updates__state]
+        # )
+
+        # util.map_over_lists(
+        #     lambda x: x[1],
+        #     updates__state
+        # )
+
         next_substates = [u__s[1] for u__s in updates__state]
         subupdates = [u__s[0] for u__s in updates__state]
         next_subparams = optax.apply_updates(subparams, subupdates)
 
         next_state = AdditionState(next_substates, next_subparams)
 
-
-        updates = jtu.tree_map(
-            lambda *u_i: sum(u_i) / len(updates__state),
-            *subupdates #*[u__s[0] for u__s in updates__state]
+        # updates = jnp.sum(jnp.array(subupdates), axis=0)
+        next_updates = jtu.tree_map(
+            lambda *u_i: jnp.sum(jnp.array(u_i), axis=0) / len(updates__state),
+            *subupdates  # *[u__s[0] for u__s in updates__state]
         )
         # jax.debug.print("new state: {}",new_state)
-
-        return updates, next_state
+        return next_updates, next_state
 
     return optax.GradientTransformation(init_fn, update_fn)
 
@@ -346,7 +379,7 @@ class MechanicState(NamedTuple):
     prev_random_scale: jax.Array
     incremental_variation: jax.Array
     incremental_sum: jax.Array
-    iter_count:  jax.Array
+    iter_count: jax.Array
     update_count: jax.Array
     logging: logstate.Log
 
@@ -356,16 +389,18 @@ def mechanize_single_beta(
     s_init: float = 1e-8,
     optimistic: bool = False,
     weight_decay: float = 0.0,
-    incremental: bool=False,
-    per_layer: bool=False,
-    randomize_incremental: bool=False,
+    incremental: bool = False,
+    per_layer: bool = False,
+    randomize_incremental: bool = False,
     beta: float = 1.0,
     max_tuner_output: float = 1e-3,
-    use_incremental_variation: bool=False,
+    use_incremental_variation: bool = False,
     **kwargs
 ) -> optax.GradientTransformation:
     if optimistic:
-        tuner = optimistic_mirror_descent_tuner(beta=beta, max_tuner_output=max_tuner_output)
+        tuner = optimistic_mirror_descent_tuner(
+            beta=beta, max_tuner_output=max_tuner_output
+        )
     else:
         tuner = mirror_descent_tuner(beta=beta, max_tuner_output=max_tuner_output)
     return mechanize(
@@ -381,13 +416,16 @@ def mechanize_single_beta(
     )
 
 
-def summed_optax_tuner(betas=[0.9, 0.99, 0.999, 0.9999, 0.99999, 0.999999], num_iter=None, betas2=None):
+def summed_optax_tuner(
+    betas=[0.9, 0.99, 0.999, 0.9999, 0.99999, 0.999999], num_iter=None, betas2=None
+):
     if betas2 is None:
         betas2 = [None for b in betas]
-    tuners = [optax_tuner(beta=beta, num_iter=num_iter, beta2=beta2) for beta, beta2 in zip(betas, betas2)]
+    tuners = [
+        optax_tuner(beta=beta, num_iter=num_iter, beta2=beta2)
+        for beta, beta2 in zip(betas, betas2)
+    ]
     return add_optimizers(tuners)
-
-
 
 
 def summed_mirror_descent(
@@ -406,24 +444,28 @@ def summed_mirror_descent(
     else:
         tuner_factory = mirror_descent_tuner
 
-    md_tuners = [tuner_factory(beta=b, epsilon=eps, max_tuner_output=max_tuner_output) for b, eps in zip(betas, epsilons)]
+    md_tuners = [
+        tuner_factory(beta=b, epsilon=eps, max_tuner_output=max_tuner_output)
+        for b, eps in zip(betas, epsilons)
+    ]
     return add_optimizers(md_tuners)
+
 
 def optax_like_mechanize(
     base_optimizer: optax.GradientTransformation,
     s_init: float = 1e-8,
     betas: List[float] = [0.9, 0.99, 0.999, 0.9999, 0.99999, 0.999999],
     weight_decay: float = 0.0,
-    incremental: bool =  False,
+    incremental: bool = False,
     randomize_incremental: bool = False,
     use_incremental_variation: bool = False,
-    betas2 = None,
-    num_iter = None,
+    betas2=None,
+    num_iter=None,
     **kwargs
 ) -> optax.GradientTransformation:
-    '''
+    """
     re-implement the original mechanic in optax using this framework.
-    '''
+    """
     tuner = summed_optax_tuner(betas, num_iter, betas2=betas2)
     return mechanize(
         base_optimizer,
@@ -436,23 +478,25 @@ def optax_like_mechanize(
         **kwargs
     )
 
+
 def mechanize(
     base_optimizer: optax.GradientTransformation,
     tuner_optimizer: optax.GradientTransformation = None,
     s_init: float = 1e-8,
-    optimistic: bool = False, # only used if tuner_optimizer is not sp
+    optimistic: bool = False,  # only used if tuner_optimizer is not sp
     betas=[1.0, 0.9, 0.99, 0.999, 0.9999, 0.99999, 0.999999],
     weight_decay: float = 0.0,
     incremental: bool = False,  # if true, do an an update relative to the previous iterate rather than the starting  iterate.
-    randomize_incremental:  bool = False, #  if true,  use random exponential scaling on an incremental update, otherwise don't scale (i.e. scale by 1.0)
-    per_layer: bool=False,
-    max_tuner_output: float=None,
+    randomize_incremental: bool = False,  #  if true,  use random exponential scaling on an incremental update, otherwise don't scale (i.e. scale by 1.0)
+    per_layer: bool = False,
+    max_tuner_output: float = None,
     use_incremental_variation: bool = False,
     averaging_momentum: float = 0.0,
     freeze_s_iteration: Optional[int] = None,
     randomize_after_freeze: bool = False,
+    tuner_decay_schedule="constant",
 ) -> optax.GradientTransformation:
-    '''
+    """
     Args:
     base_optimizer: the base optimizer to learn learning rate for.
     tuner_optimizer: the optimizer  to  use to learn the learning rate.
@@ -474,9 +518,24 @@ def mechanize(
     freeze_s_iteration: after this many iterations, stop updating s. If we are using randomized
         scaling in the incremental update, also stop applying the randomized scaling.
     randomize_after_freeze:  if true, apply randomization after freeze where  relevant.
-    '''
+    tuner_decay_schedule: schedule to apply to the tuner updates. Can be:
+        'constant' (no schedule)
+        'linearl' (linear decay)
+    """
+
+    if tuner_decay_schedule == "constant":
+        tuner_decay_fn = lambda t, updates: updates
+    elif tuner_decay_schedule == "linear":
+        tuner_decay_fn = lambda t, updates: jtu.tree_map(
+            lambda x: x * (freeze_s_iteration - t) / freeze_s_iteration, updates
+        )
+    else:
+        raise ValueError("unknown tuner_decay_schedule")
+
     if tuner_optimizer is None:
-        tuner_optimizer = summed_mirror_descent(betas, optimistic, max_tuner_output=max_tuner_output)
+        tuner_optimizer = summed_mirror_descent(
+            betas, optimistic, max_tuner_output=max_tuner_output
+        )
 
     def init_fn(params: optax.Params):
         offset = jtu.tree_map(jnp.zeros_like, params)
@@ -484,10 +543,7 @@ def mechanize(
         if not per_layer:
             s = jnp.array(s_init)
         else:
-            s = jtu.tree_map(
-                lambda p: jnp.array(s_init),
-                params
-            )
+            s = jtu.tree_map(lambda p: jnp.array(s_init), params)
         tuner_state = tuner_optimizer.init(s)
         # print("initial s: ",jtu.tree_leaves(s))
         if per_layer:
@@ -507,14 +563,17 @@ def mechanize(
             iter_count=0,
             logging=logstate.Log(
                 {
-                    'reward': 0.0,
-                    'reward_std': 0.0,
-                    'mechanic/max_s':0.0,
-                    'mechanic/min_s':0.0,
-                    'mechanic/tuner_update_count': 0,
-                    'mechanic/incremental_variation': 0.0,
-                    'mechanic/incremental_sum': 0.0,
-    })
+                    "reward": 0.0,
+                    "reward_std": 0.0,
+                    "mechanic/max_s": 0.0,
+                    "mechanic/min_s": 0.0,
+                    "mechanic/tuner_update_count": 0,
+                    "mechanic/incremental_variation": 0.0,
+                    "mechanic/incremental_sum": 0.0,
+                    "mechanic/offset_norm": 0.0,
+                    "mechanic/scaled_offset_norm": 0.0,
+                }
+            ),
         )
 
     def update_fn(
@@ -527,11 +586,11 @@ def mechanize(
         tuner_state = state.tuner_state
         s = state.s
         next_key, to_use = jax.random.split(state.key)
-        reward = state.logging.data['reward']
-        reward_std = state.logging.data['reward_std']
-        incremental_variation=state.incremental_variation
+        reward = state.logging.data["reward"]
+        reward_std = state.logging.data["reward_std"]
+        incremental_variation = state.incremental_variation
         incremental_sum = state.incremental_sum
-        prev_random_scale=state.prev_random_scale
+        prev_random_scale = state.prev_random_scale
         update_count = state.update_count
         iter_count = state.iter_count
 
@@ -548,7 +607,6 @@ def mechanize(
         else:
             next_offset = tree_add(offset, base_updates)
 
-            
         if not per_layer:
             inner_product = tree_dot(
                 offset,
@@ -556,26 +614,44 @@ def mechanize(
                     grads,
                     tree_scale(
                         params,
-                        state.s * weight_decay * tree_norm(grads) / (tree_norm(params) + 1e-8),
+                        state.s
+                        * weight_decay
+                        * tree_norm(grads)
+                        / (tree_norm(params) + 1e-8),
                     ),
                 ),
             )
             reward_increment = inner_product * s
-            next_incremental_variation = incremental_variation*use_incremental_variation + inner_product**2
-            next_incremental_sum = incremental_sum*use_incremental_variation + inner_product
+            next_incremental_variation = (
+                incremental_variation * use_incremental_variation + inner_product**2
+            )
+            next_incremental_sum = (
+                incremental_sum * use_incremental_variation + inner_product
+            )
 
-            
         else:
             inner_product = jtu.tree_map(
-                lambda o, g, s, p: jnp.sum(o * (g + p * s * weight_decay * jnp.linalg.norm(g) / (jnp.linalg.norm(p) + 1e-8) ) ),
+                lambda o, g, s, p: jnp.sum(
+                    o
+                    * (
+                        g
+                        + p
+                        * s
+                        * weight_decay
+                        * jnp.linalg.norm(g)
+                        / (jnp.linalg.norm(p) + 1e-8)
+                    )
+                ),
                 offset,
                 grads,
                 state.s,
-                params
+                params,
             )
             reward_increment = tree_dot(inner_product, s)
 
-            next_incremental_variation = incremental_variation + tree_norm(inner_product)**2
+            next_incremental_variation = (
+                incremental_variation + tree_norm(inner_product) ** 2
+            )
             next_incremental_sum = tree_add(incremental_sum, inner_product)
 
         log_next_incremental_variation = next_incremental_variation
@@ -592,34 +668,57 @@ def mechanize(
                 inner_product, tuner_state, s
             )
 
+        s_update = tuner_decay_fn(iter_count, s_update)
+
         next_s = tree_add(s, s_update)
 
         if freeze_s_iteration is not None:
             should_freeze_s = iter_count > freeze_s_iteration
             # if we have exceeded the freeze_s_iteration, then stop updating s
-            next_s = jax.lax.cond(
+            next_s, next_tuner_state = jax.lax.cond(
                 should_freeze_s,
-                lambda: s,
-                lambda: next_s)
+                lambda: (s, tuner_state),
+                lambda: (next_s, next_tuner_state),
+            )
 
         if use_incremental_variation:
             baseline_incremental_sum = optu.tree_zeros_like(incremental_sum)
-            random_scale, next_update_count, next_incremental_variation, next_incremental_sum, next_s, next_tuner_state =  jax.lax.cond(
-                jnp.sqrt(2*next_incremental_variation) > tree_norm(next_incremental_sum),
-                lambda : (random_scale,  update_count, next_incremental_variation, next_incremental_sum, s, tuner_state),
-                lambda : (random_scale,  update_count+1, 0.0, baseline_incremental_sum, next_s, next_tuner_state),
+            (
+                random_scale,
+                next_update_count,
+                next_incremental_variation,
+                next_incremental_sum,
+                next_s,
+                next_tuner_state,
+            ) = jax.lax.cond(
+                jnp.sqrt(2 * next_incremental_variation)
+                > tree_norm(next_incremental_sum),
+                lambda: (
+                    random_scale,
+                    update_count,
+                    next_incremental_variation,
+                    next_incremental_sum,
+                    s,
+                    tuner_state,
+                ),
+                lambda: (
+                    random_scale,
+                    update_count + 1,
+                    0.0,
+                    baseline_incremental_sum,
+                    next_s,
+                    next_tuner_state,
+                ),
             )
         else:
-            next_incremental_variation = 0.0
-            next_incremental_sum = 0.0
+            next_incremental_variation = state.incremental_variation
+            next_incremental_sum = state.incremental_sum
             next_update_count = update_count + 1
-            
 
-        max_s  = jtu.tree_reduce(lambda a,b: jnp.maximum(a,b),  next_s)
-        min_s  = jtu.tree_reduce(lambda a,b: jnp.minimum(a,b),  next_s)
+        max_s = jtu.tree_reduce(lambda a, b: jnp.maximum(a, b), next_s)
+        min_s = jtu.tree_reduce(lambda a, b: jnp.minimum(a, b), next_s)
 
         def compute_update_global(base_i, next_offset_i, offset_i):
-               
             if incremental:
                 # update to  apply if we are still updating s
                 standard_update = base_i * next_s * random_scale
@@ -641,27 +740,29 @@ def mechanize(
                 # next_offset * s - offset * s *  (1-averaging_momentum)
                 # = (offset + base_update) * (s+s_update)  - offset * s* ( 1- avmom)
                 # = base_update * s + s_update * next_offset + offset *  s * avmom
-                if averaging_momentum=='iter_count':
-                    avmom = 1.0/(iter_count +  1)
+                if averaging_momentum == "iter_count":
+                    avmom = 1.0 / (iter_count + 1)
                 else:
                     avmom = averaging_momentum
 
                 # update to  apply if we are still updating s
-                standard_update = base_i * s + next_offset_i * s_update + offset_i * s * avmom
+                standard_update = (
+                    base_i * s + next_offset_i * s_update + offset_i * s * avmom
+                )
 
                 # update to apply if we have stopped updating s
                 frozen_update = base_i * s + offset_i * s * avmom
 
-            
             if freeze_s_iteration is not None:
                 return jax.lax.cond(
-                    should_freeze_s,
-                    lambda: frozen_update,
-                    lambda: standard_update)
+                    should_freeze_s, lambda: frozen_update, lambda: standard_update
+                )
             else:
                 return standard_update
 
-        def compute_update_per_layer(base_i, next_offset_i, old_s_i, next_s_i, s_update_i):
+        def compute_update_per_layer(
+            base_i, next_offset_i, old_s_i, next_s_i, s_update_i
+        ):
             if incremental:
                 return base_i * next_s_i * random_scale
             else:
@@ -669,16 +770,19 @@ def mechanize(
 
         if per_layer:
             updates = jtu.tree_map(
-                compute_update_per_layer,
-                base_updates,
-                next_offset,
-                s,
-                next_s,
-                s_update
+                compute_update_per_layer, base_updates, next_offset, s, next_s, s_update
             )
         else:
-            updates = jtu.tree_map(compute_update_global, base_updates, next_offset, offset)
+            updates = jtu.tree_map(
+                compute_update_global, base_updates, next_offset, offset
+            )
 
+        if per_layer:
+            scaled_offset_norm = tree_norm(
+                jtu.tree_map(lambda o_i, s_i: o_i * s_i, next_offset, next_s)
+            )
+        else:
+            scaled_offset_norm = next_s * tree_norm(next_offset)
         next_state = MechanicState(
             offset=next_offset,
             base_state=next_base_state,
@@ -690,18 +794,23 @@ def mechanize(
             incremental_sum=next_incremental_sum,
             update_count=next_update_count,
             iter_count=iter_count + 1,
-            logging=logstate.Log({
-                'reward':reward +  reward_increment,
-                'reward_std': next_reward_std,
-                'mechanic/max_s':max_s,
-                'mechanic/min_s':min_s,
-                'mechanic/tuner_update_count':  next_update_count,
-                'mechanic/incremental_variation': log_next_incremental_variation,
-                'mechanic/incremental_sum': tree_norm(log_next_incremental_sum),
-            })
+            logging=logstate.Log(
+                {
+                    "reward": reward + reward_increment,
+                    "reward_std": next_reward_std,
+                    "mechanic/max_s": max_s,
+                    "mechanic/min_s": min_s,
+                    "mechanic/tuner_update_count": next_update_count,
+                    "mechanic/incremental_variation": log_next_incremental_variation,
+                    "mechanic/incremental_sum": tree_norm(log_next_incremental_sum),
+                    "mechanic/offset_norm": tree_norm(next_offset),
+                    "mechanic/scaled_offset_norm": scaled_offset_norm,
+                }
+            ),
         )
 
         return updates, next_state
+
     optimizer = optax.GradientTransformation(init_fn, update_fn)
 
     return optimizer
