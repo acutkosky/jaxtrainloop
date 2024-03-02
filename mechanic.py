@@ -203,7 +203,7 @@ class OptaxTunerState(NamedTuple):
     iter_count: PyTree
 
 
-def optax_tuner(beta=1.0, eps=1e-8, num_iter=None, beta2=None, square_bet_fraction=False):
+def optax_tuner(beta=1.0, eps=1e-8, num_iter=None, beta2=None):
     if beta2 is None:
         beta2 = beta**2
 
@@ -276,13 +276,8 @@ def optax_tuner(beta=1.0, eps=1e-8, num_iter=None, beta2=None, square_bet_fracti
         else:
             beta_scaling = 1.0 / jnp.sqrt(num_iter)
 
-        if square_bet_fraction:
-            bet_fraction_power = 2
-        else:
-            bet_fraction_power = 1
-
         next_s = jtu.tree_map(
-            lambda w, v: w / ((jnp.sqrt(v) * beta_scaling) ** bet_fraction_power + eps),
+            lambda w, v: w / (jnp.sqrt(v) + eps) * beta_scaling,
             wealth,
             debiased_next_sum_squared_grad,
         )

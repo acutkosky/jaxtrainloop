@@ -499,7 +499,6 @@ def get_optimizer(
                 betas=opt_config.mechanic.optax.betas,
                 betas2=opt_config.mechanic.optax.betas2,
                 num_iter=opt_config.mechanic.optax.num_iter,
-                bet_fraction_type=opt_config.mechanic.optax.bet_fraction_type,
                 per_layer=opt_config.mechanic.per_layer,
                 tuner_decay_schedule=opt_config.mechanic.tuner_decay_schedule,
             )
