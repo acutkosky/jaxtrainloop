@@ -43,22 +43,23 @@ class OptaxTunerState(NamedTuple):
     max_grad: PyTree
     sum_grad: PyTree
     sum_squared_grad: PyTree
+    s_values: PyTree
     iter_count: PyTree
 
 
 def optax_tuner(
-    beta=1.0,
+    betas=[1.0],
     eps=1e-8,
     num_iter=Union[None, int, str],
-    beta2=None,
+    betas2=None,
     bet_fraction_type="sqrt",
 ):
     """
     implements the tuner as in the original mechanic implementation in optax, with a
     few new options.
 
-    beta: beta value for decaying the reward.
-    beta2: beta value for decaying the second order stats (if None, will be beta**2)
+    betas: list of beta values for decaying the reward.
+    betas2: list of betas values for decaying the second order stats (if None, will be beta**2)
     eps: for numerical precision
     num_iter:
         If this is None, is ignore.
@@ -77,26 +78,64 @@ def optax_tuner(
 
     """
 
-    if beta2 is None:
-        beta2 = beta**2
+    if betas2 is None:
+        betas2 = [beta**2 for beta in betas]
 
-    def init_fn(s_init: PyTree):
+    betas = jnp.array(betas)
+    betas2 = jnp.array(betas2)
+
+    def make_copies(X, n=len(betas)):
+        # Ensure X is an array
+        X = jnp.array(X)
+    
+        # Ensure n is within bounds
+        if n <= 0:
+            raise ValueError("Invalid value of n, it must be greater than 0.")
+    
+        # Repeat the array X along the last axis
+        Y = jnp.repeat(X[..., None], n, axis=-1)
+    
+        return Y
+    def tree_make_copies(t):
+        return jtu.tree_map(
+            make_copies,
+            t
+        )
+
+    def tree_make_zero_init(t):
+        return jtu.tree_map(
+            make_zero_init,
+            t
+        )
+
+    def make_zero_init(x):
+        return make_copies(jnp.zeros_like(x))
+    
+
+    def init_fn(s_init: jax.Array):
         state = OptaxTunerState(
-            reward=optu.tree_zeros_like(s_init),
+            reward=tree_make_zero_init(s_init),
             s_init=util.tree_copy(s_init),
-            max_grad=optu.tree_zeros_like(s_init),
-            sum_squared_grad=optu.tree_zeros_like(s_init),
-            sum_grad=optu.tree_zeros_like(s_init),
+            max_grad=tree_make_zero_init(s_init),
+            sum_squared_grad=tree_make_zero_init(s_init),
+            sum_grad=tree_make_zero_init(s_init),
+            s_values=tree_make_copies(s_init),
             iter_count=0,
         )
         return state
 
-    def update_fn(grads, state, s_values):
+    def update_fn(grads, state, summed_s_value):
+        grads = tree_make_copies(grads)
+        # jtu.tree_map(
+        #     lambda x: x[...,None],
+        #     grads
+        # )
+        
         clipped_grads = jtu.tree_map(
             lambda g_i, m_i: jax.lax.clamp(-m_i, g_i, m_i), grads, state.max_grad
         )
         next_max_grad = jtu.tree_map(
-            lambda g_i, m_i: jnp.maximum(beta * m_i, jnp.abs(g_i) + eps),
+            lambda g_i, m_i: jnp.maximum(betas * m_i, jnp.abs(g_i) + eps),
             grads,
             state.max_grad,
         )
@@ -104,35 +143,35 @@ def optax_tuner(
         next_iter_count = state.iter_count + 1
         if num_iter is None:
             next_sum_squared_grad = jtu.tree_map(
-                lambda v_i, g_i: beta2 * v_i + g_i**2, state.sum_squared_grad, grads
+                lambda v_i, g_i: betas2 * v_i + g_i**2, state.sum_squared_grad, grads
             )
             next_sum_grad = jtu.tree_map(
-                lambda m_i, g_i: beta * m_i + g_i, state.sum_grad, grads
+                lambda m_i, g_i: betas * m_i + g_i, state.sum_grad, grads
             )
             debiased_next_sum_grad = next_sum_grad
             debiased_next_sum_squared_grad = next_sum_squared_grad
         else:
             next_sum_squared_grad = jtu.tree_map(
-                lambda v_i, g_i: beta2 * v_i + (1 - beta2) * g_i**2,
+                lambda v_i, g_i: betas2 * v_i + (1 - betas2) * g_i**2,
                 state.sum_squared_grad,
                 grads,
             )
             next_sum_grad = jtu.tree_map(
-                lambda m_i, g_i: beta * m_i + (1 - beta) * g_i, state.sum_grad, grads
+                lambda m_i, g_i: betas * m_i + (1 - betas) * g_i, state.sum_grad, grads
             )
             debiased_next_sum_grad = jtu.tree_map(
-                lambda m_i: m_i / (1.0 - beta**next_iter_count),
+                lambda m_i: m_i / (1.0 - betas**next_iter_count),
                 next_sum_grad,
             )
             debiased_next_sum_squared_grad = jtu.tree_map(
-                lambda v_i: v_i / (1.0 - beta2**next_iter_count),
+                lambda v_i: v_i / (1.0 - betas2**next_iter_count),
                 next_sum_squared_grad,
             )
 
         next_reward = jtu.tree_map(
-            lambda r_i, s_i, g_i: beta * r_i - g_i * s_i,
+            lambda r_i, s_i, g_i: betas * r_i - g_i * s_i,
             state.reward,
-            s_values,
+            state.s_values,
             clipped_grads,
         )
 
@@ -146,10 +185,10 @@ def optax_tuner(
         # )
 
         wealth = jtu.tree_map(
-            lambda s_init_i, m_i, r_i: s_init_i * m_i + jnp.clip(r_i, 0),
-            state.s_init,
+            lambda m_i, r_i, s_init_i: s_init_i * m_i + jnp.clip(r_i, 0),
             next_max_grad,
             next_reward,
+            state.s_init
         )
 
         if num_iter is None:
@@ -157,9 +196,9 @@ def optax_tuner(
         elif num_iter == "anytime":
             beta_scaling = 1.0 / jnp.sqrt(next_iter_count)
         elif num_iter == "usebeta1":
-            beta_scaling = jnp.sqrt(1 - beta)
+            beta_scaling = jnp.sqrt(1 - betas)
         elif num_iter == "usebeta2":
-            beta_scaling = jnp.sqrt(1 - beta2)
+            beta_scaling = jnp.sqrt(1 - betas2)
         else:
             beta_scaling = 1.0 / jnp.sqrt(num_iter)
 
@@ -177,7 +216,7 @@ def optax_tuner(
                 debiased_next_sum_squared_grad,
             )
 
-        next_s = jtu.tree_map(lambda w_i, b_i: w_i * b_i, wealth, bet_fraction)
+        next_s_values = jtu.tree_map(lambda w_i, b_i: w_i * b_i, wealth, bet_fraction)
 
         next_state = OptaxTunerState(
             reward=next_reward,
@@ -185,10 +224,21 @@ def optax_tuner(
             max_grad=next_max_grad,
             sum_squared_grad=next_sum_squared_grad,
             sum_grad=next_sum_grad,
+            s_values=next_s_values,
             iter_count=next_iter_count,
         )
 
-        updates = tree_subtract(next_s, s_values)
+        next_summed_s_value = jtu.tree_map(
+            lambda s: jnp.sum(s, axis=-1)/len(betas),
+            next_s_values
+        )
+        prev_summed_s_value = jtu.tree_map(
+            lambda s: jnp.sum(s, axis=-1)/len(betas),
+            state.s_values
+        )
+
+
+        updates = tree_subtract(next_summed_s_value ,prev_summed_s_value)
 
         return updates, next_state
 
@@ -207,8 +257,8 @@ def add_optimizers(optimizers: Tuple[optax.GradientTransformation]):
 
     def init_fn(params: optax.Params):
         substate = [opt.init(params) for opt in optimizers]
-        subparams = [jtu.tree_map(jnp.array, params) for op in optimizers]
-        return AdditionState(substate, subparams)
+        # subparams = [jtu.tree_map(jnp.array, params) for op in optimizers]
+        return AdditionState(substate, [])#subparams)
 
     def update_fn(
         updates: optax.Updates,
@@ -217,21 +267,36 @@ def add_optimizers(optimizers: Tuple[optax.GradientTransformation]):
     ):
         substates = state.substates
         subparams = state.subparams
-        updates__state = [
-            opt.update(updates, s, p)
-            for opt, s, p in zip(optimizers, substates, subparams)
-        ]
+        # updates__state = [
+        #     opt.update(updates, s, p)
+        #     for opt, s, p in zip(optimizers, substates, subparams)
+        # ]
 
-        next_substates = [u__s[1] for u__s in updates__state]
-        subupdates = [u__s[0] for u__s in updates__state]
-        next_subparams = optax.apply_updates(subparams, subupdates)
+        # next_substates = [u__s[1] for u__s in updates__state]
+        # subupdates = [u__s[0] for u__s in updates__state]
+        # next_subparams = optax.apply_updates(subparams, subupdates)
 
-        next_state = AdditionState(next_substates, next_subparams)
+        # next_state = AdditionState(next_substates, next_subparams)
 
-        next_updates = jtu.tree_map(
-            lambda *u_i: jnp.sum(jnp.array(u_i), axis=0) / len(updates__state),
-            *subupdates
-        )
+        # next_updates = subupdates[0]
+
+        # for subupdate_i in subupdates[:-1]:
+        #     next_updates = jtu.tree_map(
+        #         jnp.add,
+        #         next_updates,
+        #         subupdate_i
+        #     )
+        # next_updates = jtu.tree_map(
+        #     lambda x: x/len(subupdates),
+        #     next_updates
+        # )
+
+        # next_updates = jtu.tree_map(
+        #     lambda *u_i: jnp.sum(jnp.array(u_i), axis=0) / len(updates__state),
+        #     *subupdates
+        # )
+        next_updates = optu.tree_zeros_like(updates)
+        next_state = state
         return next_updates, next_state
 
     return optax.GradientTransformation(init_fn, update_fn)
@@ -298,9 +363,10 @@ def optax_like_mechanize(
         argument for tuner, see tuner docstring.
 
     """
-    tuner = summed_optax_tuner(
-        betas, num_iter, betas2=betas2, bet_fraction_type=bet_fraction_type
-    )
+    # tuner = summed_optax_tuner(
+    #     betas, num_iter, betas2=betas2, bet_fraction_type=bet_fraction_type
+    # )
+    tuner = optax_tuner(betas=betas, num_iter=num_iter, betas2=betas2, bet_fraction_type=bet_fraction_type)
     return mechanize(
         base_optimizer,
         tuner_optimizer=tuner,
@@ -319,6 +385,7 @@ def mechanize(
     per_layer: bool = False,
     averaging_momentum: float = 0.0,
     freeze_s_iteration: Optional[int] = None,
+    tuner_lr: float = 1.0,
     tuner_decay_schedule="constant",
 ) -> optax.GradientTransformation:
     """
@@ -333,6 +400,7 @@ def mechanize(
         update_{t+1} = update_t + ((average of iterates x_t) - x_1)
         This is distinct from iterate averaging. Setting to 0 turns it off.
         So far, this never helps :)
+    tuner_lr: scale the tuner updates by this amount.
     freeze_s_iteration: after this many iterations, stop updating s. If we are using randomized
         scaling in the incremental update, also stop applying the randomized scaling.
     tuner_decay_schedule: schedule to apply to the tuner updates. Can be:
@@ -341,10 +409,12 @@ def mechanize(
     """
 
     if tuner_decay_schedule == "constant":
-        tuner_decay_fn = lambda t, updates: updates
+        tuner_decay_fn = lambda t, updates: jtu.tree_map(
+            lambda x: x * tuner_lr, updates
+        )
     elif tuner_decay_schedule == "linear":
         tuner_decay_fn = lambda t, updates: jtu.tree_map(
-            lambda x: x * (freeze_s_iteration - t) / freeze_s_iteration, updates
+            lambda x: x * tuner_lr * (freeze_s_iteration - t) / freeze_s_iteration, updates
         )
     else:
         raise ValueError("unknown tuner_decay_schedule")

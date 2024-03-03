@@ -43,12 +43,12 @@ mechanic:
   freeze_s_iteration: null
   randomize_after_freeze: False
   tuner_decay_schedule: constant
+  tuner_lr: 1.0
   optax:
     betas2: null
     betas: [0.9, 0.99, 0.999, 0.9999, 0.99999, 0.999999]
     num_iter: 50000
     bet_fraction_type: sqrt
-  
 
 random_scale_type: none
 base_opt: capped_cb

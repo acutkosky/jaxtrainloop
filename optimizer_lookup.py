@@ -514,6 +514,7 @@ def get_optimizer(
                 bet_fraction_type=opt_config.mechanic.optax.bet_fraction_type,
                 per_layer=opt_config.mechanic.per_layer,
                 tuner_decay_schedule=opt_config.mechanic.tuner_decay_schedule,
+                tuner_lr=opt_config.mechanic.tuner_lr,
             )
         elif opt_config.mechanize == "new":
             betas = [0.9, 0.99, 0.999, 0.9999, 0.99999, 0.999999]
