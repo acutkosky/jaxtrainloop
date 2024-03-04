@@ -245,61 +245,6 @@ def optax_tuner(
     return optax.GradientTransformation(init_fn, update_fn)
 
 
-class AdditionState(NamedTuple):
-    substates: List[optax.OptState]
-    subparams: List[optax.Params]
-
-
-# for some reasonn this thing compiles EXTREMELY SLOWLY
-# if the base optimizers are per-layer and there is more than one of them...
-def add_optimizers(optimizers: Tuple[optax.GradientTransformation]):
-    """wrapper for adding up a bunch of optimizer outputs"""
-
-    def init_fn(params: optax.Params):
-        substate = [opt.init(params) for opt in optimizers]
-        # subparams = [jtu.tree_map(jnp.array, params) for op in optimizers]
-        return AdditionState(substate, [])#subparams)
-
-    def update_fn(
-        updates: optax.Updates,
-        state: AdditionState,
-        params: Optional[optax.Params] = None,
-    ):
-        substates = state.substates
-        subparams = state.subparams
-        # updates__state = [
-        #     opt.update(updates, s, p)
-        #     for opt, s, p in zip(optimizers, substates, subparams)
-        # ]
-
-        # next_substates = [u__s[1] for u__s in updates__state]
-        # subupdates = [u__s[0] for u__s in updates__state]
-        # next_subparams = optax.apply_updates(subparams, subupdates)
-
-        # next_state = AdditionState(next_substates, next_subparams)
-
-        # next_updates = subupdates[0]
-
-        # for subupdate_i in subupdates[:-1]:
-        #     next_updates = jtu.tree_map(
-        #         jnp.add,
-        #         next_updates,
-        #         subupdate_i
-        #     )
-        # next_updates = jtu.tree_map(
-        #     lambda x: x/len(subupdates),
-        #     next_updates
-        # )
-
-        # next_updates = jtu.tree_map(
-        #     lambda *u_i: jnp.sum(jnp.array(u_i), axis=0) / len(updates__state),
-        #     *subupdates
-        # )
-        next_updates = optu.tree_zeros_like(updates)
-        next_state = state
-        return next_updates, next_state
-
-    return optax.GradientTransformation(init_fn, update_fn)
 
 
 class MechanicState(NamedTuple):
@@ -310,30 +255,30 @@ class MechanicState(NamedTuple):
     iter_count: jax.Array
     logging: logstate.Log
 
-
-def summed_optax_tuner(
-    betas=[0.9, 0.99, 0.999, 0.9999, 0.99999, 0.999999],
-    num_iter=None,
-    betas2=None,
-    **kwargs
-):
-    """
-    creates a tuner whose output is given by averaging the output
-    of many tuners with different beta values.
-
-    betas: list of beta values
-    num_iter: num_iter argument to the tuner
-    betas2: if not None, then also a list of beta2 values of the same size as betas
-    **kwargs: other arguments to give to the tuner
-    """
-    if betas2 is None:
-        betas2 = [None for b in betas]
-    tuners = [
-        optax_tuner(beta=beta, num_iter=num_iter, beta2=beta2, **kwargs)
-        for beta, beta2 in zip(betas, betas2)
-    ]
-    return add_optimizers(tuners)
-
+def per_layer_mechanize(
+    base_optimizer,
+    s_init=1e-8,
+    beta=[1.0,1.0,1.0,1.0,1.0,1.0],
+    weight_decay=0.0,
+    betas2=[0.9,0.99,0.999,0.9999,0.99999,0.999999],
+    num_iter='anytime',
+    bet_fraction_type="sqrt",
+    freeze_s_iteration: Optional[int] = None,
+    tuner_lr: float = 1.0,
+    tuner_decay_schedule="constant",
+    ):
+    return optax_like_mechanize(
+        base_optimizer,
+        s_init,
+        betas2,
+        weight_decay,
+        betas2,
+        num_iter,
+        bet_fraction_type,
+        freeze_s_iteration,
+        tuner_lr,
+        tuner_decay_schedule
+    )
 
 def optax_like_mechanize(
     base_optimizer: optax.GradientTransformation,
@@ -343,10 +288,13 @@ def optax_like_mechanize(
     betas2=None,
     num_iter=None,
     bet_fraction_type="sqrt",
+    freeze_s_iteration: Optional[int] = None,
+    tuner_lr: float = 1.0,
+    tuner_decay_schedule="constant",
     **kwargs
 ) -> optax.GradientTransformation:
     """
-    re-implement the original mechanic in optax using this framework.
+    re-implement the original mechanic in optax using this framework (with some changes).
 
     s_init:
         initial s value
@@ -361,11 +309,14 @@ def optax_like_mechanize(
         docstring)
     bet_fraction_type:
         argument for tuner, see tuner docstring.
+    tuner_lr: scale the tuner updates by this amount.
+    freeze_s_iteration: after this many iterations, stop updating s. If we are using randomized
+        scaling in the incremental update, also stop applying the randomized scaling.
+    tuner_decay_schedule: schedule to apply to the tuner updates. Can be:
+        'constant' (no schedule)
+        'linear' (linear decay)
 
     """
-    # tuner = summed_optax_tuner(
-    #     betas, num_iter, betas2=betas2, bet_fraction_type=bet_fraction_type
-    # )
     tuner = optax_tuner(betas=betas, num_iter=num_iter, betas2=betas2, bet_fraction_type=bet_fraction_type)
     return mechanize(
         base_optimizer,
