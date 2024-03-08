@@ -516,6 +516,19 @@ def get_optimizer(
                 tuner_decay_schedule=opt_config.mechanic.tuner_decay_schedule,
                 tuner_lr=opt_config.mechanic.tuner_lr,
             )
+        elif opt_config.mechanize == "simplified_mirror_descent_mechanic":
+            optimizer = simplified_mechanic.mirror_descent_mechanize(
+                optimizer,
+                weight_decay=opt_config.mechanic.weight_decay,
+                averaging_momentum=opt_config.mechanic.averaging_momentum,
+                freeze_s_iteration=opt_config.mechanic.freeze_s_iteration,
+                betas=opt_config.mechanic.optax.betas,
+                betas2=opt_config.mechanic.optax.betas2,
+                bet_fraction_type=opt_config.mechanic.optax.bet_fraction_type,
+                per_layer=opt_config.mechanic.per_layer,
+                tuner_decay_schedule=opt_config.mechanic.tuner_decay_schedule,
+                tuner_lr=opt_config.mechanic.tuner_lr,
+            )
         elif opt_config.mechanize == "new":
             betas = [0.9, 0.99, 0.999, 0.9999, 0.99999, 0.999999]
             if opt_config.mechanic.use_one_beta:
