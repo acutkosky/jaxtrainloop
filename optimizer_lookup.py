@@ -515,6 +515,7 @@ def get_optimizer(
                 per_layer=opt_config.mechanic.per_layer,
                 tuner_decay_schedule=opt_config.mechanic.tuner_decay_schedule,
                 tuner_lr=opt_config.mechanic.tuner_lr,
+                incremental=opt_config.mechanic.incremental,
             )
         elif opt_config.mechanize == "simplified_mirror_descent_mechanic":
             optimizer = simplified_mechanic.mirror_descent_mechanize(

@@ -95,7 +95,7 @@ def mirror_descent_tuner(
         bet_fraction_type: can be "log" or "sqrt" or "linear"
             if "log", goes for log(T) origin regret.
             if "sqrt", allows sqrt(T) origin regret.
-            if "linear", actually allows for O(T) origin regret (but maybe this 
+            if "linear", actually allows for O(T) origin regret (but maybe this
                 is just analysis?)
         eps: small value for numerical precision
     """
@@ -108,13 +108,7 @@ def mirror_descent_tuner(
 
     def init_fn(s_init: optax.Params):
         n = len(betas)
-        alpha = make_copies(
-            jtu.tree_map(
-                lambda s_i: s_i/4.0,
-                s_init
-            ),
-            n
-        )
+        alpha = make_copies(jtu.tree_map(lambda s_i: s_i / 4.0, s_init), n)
         state = MDTunerState(
             s_init=util.tree_copy(s_init),
             max_grad=tree_make_zero_init(s_init, n),
@@ -122,14 +116,16 @@ def mirror_descent_tuner(
             alpha=alpha,
             inner_s_values=tree_make_zero_init(s_init, n),
             iter_count=0,
-            log_data=logstate.Log({
-                "mirror_descent_mechanic/max_grad": 0.0,
-                "mirror_descent_mechanic/sum_squared_grad": 0.0,
-                "mirror_descent_mechanic/alpha": 0.0,
-                "mirror_descent_mechanic/rescaled_sum_squared_grad": 0.0,
-                "mirror_descent_mechanic/theta": 0.0,
-                "mirror_descent_mechanic/g": 0.0,
-            }),
+            log_data=logstate.Log(
+                {
+                    "mirror_descent_mechanic/max_grad": 0.0,
+                    "mirror_descent_mechanic/sum_squared_grad": 0.0,
+                    "mirror_descent_mechanic/alpha": 0.0,
+                    "mirror_descent_mechanic/rescaled_sum_squared_grad": 0.0,
+                    "mirror_descent_mechanic/theta": 0.0,
+                    "mirror_descent_mechanic/g": 0.0,
+                }
+            ),
         )
         return state
 
@@ -143,7 +139,9 @@ def mirror_descent_tuner(
         # )
 
         clipped_grads = jtu.tree_map(
-            lambda g_i, m_i: jax.lax.clamp(-m_i, g_i, m_i)/(m_i  + eps), grads, state.max_grad
+            lambda g_i, m_i: jax.lax.clamp(-m_i, g_i, m_i) / (m_i + eps),
+            grads,
+            state.max_grad,
         )
         next_max_grad = jtu.tree_map(
             lambda g_i, m_i: jnp.maximum(betas2 * m_i, jnp.abs(g_i) + eps),
@@ -154,7 +152,9 @@ def mirror_descent_tuner(
         next_iter_count = state.iter_count + 1
 
         next_sum_squared_grad = jtu.tree_map(
-            lambda v_i, g_i: betas2 * v_i + g_i**2, state.sum_squared_grad, clipped_grads
+            lambda v_i, g_i: betas2 * v_i + g_i**2,
+            state.sum_squared_grad,
+            clipped_grads,
         )
 
         # modify the denominator to avoid nans but use where for
@@ -168,7 +168,7 @@ def mirror_descent_tuner(
             (1.0 - betas2) / (eps + 1.0 - betas2**next_iter_count),
         )
         rescaled_next_sum_squared_grad = jtu.tree_map(
-            lambda v_i, G_i: v_i * debias_ratios *  next_iter_count + 4 * G_i**2,
+            lambda v_i, G_i: v_i * debias_ratios * next_iter_count + 4 * G_i**2,
             next_sum_squared_grad,
             next_max_grad,
         )
@@ -184,10 +184,9 @@ def mirror_descent_tuner(
             )
         elif bet_fraction_type == "linear":
             rescaled_next_sum_squared_grad = jtu.tree_map(
-                lambda m: m**2,
-                next_max_grad
+                lambda m: m**2, next_max_grad
             )
-            
+
         next_alpha = jtu.tree_map(
             lambda s_i, G_i, v_i: s_i * G_i**2 / (v_i + eps) + eps,
             state.s_init,
@@ -203,23 +202,26 @@ def mirror_descent_tuner(
         # next_alpha = state.alpha
 
         theta = jtu.tree_map(
-            lambda s_i, a_i, g_i, v_i: jnp.clip(2 * jnp.log(s_i / a_i) / etas - g_i - 2*etas*g_i**2, 0.0),
+            lambda s_i, a_i, g_i, v_i: jnp.clip(
+                2 * jnp.log(s_i / a_i) / etas - g_i - 2 * etas * g_i**2, 0.0
+            ),
             state.inner_s_values,
             state.alpha,
             clipped_grads,
-            rescaled_next_sum_squared_grad
+            rescaled_next_sum_squared_grad,
         )
 
         next_inner_s_values = jtu.tree_map(
-            lambda a_i, theta_i, g_i: a_i
-            * (jnp.exp(0.5 * etas * theta_i)),
+            lambda a_i, theta_i, g_i: a_i * (jnp.exp(0.5 * etas * theta_i)),
             next_alpha,
             theta,
             clipped_grads,
         )
 
         next_s_values = jtu.tree_map(
-            lambda s_i, s_init_i: jnp.sum(s_i, axis=-1)/len(betas), next_inner_s_values, state.s_init
+            lambda s_i, s_init_i: jnp.sum(s_i, axis=-1) / len(betas),
+            next_inner_s_values,
+            state.s_init,
         )
 
         s_updates = jtu.tree_map(
@@ -233,14 +235,22 @@ def mirror_descent_tuner(
             inner_s_values=next_inner_s_values,
             iter_count=next_iter_count,
             alpha=next_alpha,
-            log_data=logstate.Log({
-                "mirror_descent_mechanic/max_grad": util.tree_reduce_mean(next_max_grad),
-                "mirror_descent_mechanic/sum_squared_grad": util.tree_reduce_mean(next_sum_squared_grad),
-                "mirror_descent_mechanic/alpha": util.tree_reduce_mean(next_alpha),
-                "mirror_descent_mechanic/rescaled_sum_squared_grad": util.tree_reduce_mean(rescaled_next_sum_squared_grad),
-                "mirror_descent_mechanic/theta": util.tree_reduce_mean(theta),
-                "mirror_descent_mechanic/g": util.tree_reduce_mean(clipped_grads),
-            }),
+            log_data=logstate.Log(
+                {
+                    "mirror_descent_mechanic/max_grad": util.tree_reduce_mean(
+                        next_max_grad
+                    ),
+                    "mirror_descent_mechanic/sum_squared_grad": util.tree_reduce_mean(
+                        next_sum_squared_grad
+                    ),
+                    "mirror_descent_mechanic/alpha": util.tree_reduce_mean(next_alpha),
+                    "mirror_descent_mechanic/rescaled_sum_squared_grad": util.tree_reduce_mean(
+                        rescaled_next_sum_squared_grad
+                    ),
+                    "mirror_descent_mechanic/theta": util.tree_reduce_mean(theta),
+                    "mirror_descent_mechanic/g": util.tree_reduce_mean(clipped_grads),
+                }
+            ),
         )
 
         return s_updates, next_state
@@ -289,10 +299,10 @@ def optax_tuner(
 
     """
 
-    if betas2 is None:
-        betas2 = [beta**2 for beta in betas]
-
     betas = jnp.array(betas)
+    if betas2 is None:
+        betas2 = betas**2
+
     betas2 = jnp.array(betas2)
 
     # def make_copies(X, n=len(betas)):
@@ -453,6 +463,71 @@ def optax_tuner(
     return optax.GradientTransformation(init_fn, update_fn)
 
 
+class CombinedTunerState(NamedTuple):
+    per_layer_state: OptaxTunerState
+    scalar_state: OptaxTunerState
+    per_layer_s_values: optax.Params
+    scalar_s_values: optax.Params
+
+
+def combined_per_layer_optax_tuner(
+    betas=[1.0],
+    eps=1e-8,
+    num_iter=Union[None, int, str],
+    betas2=None,
+    bet_fraction_type="sqrt",
+):
+    per_layer_tuner = optax_tuner(betas, eps, num_iter, betas2, bet_fraction_type)
+    scalar_tuner = optax_tuner(betas, eps, num_iter, betas2, bet_fraction_type)
+
+    def init_fn(s_init: optax.Params):
+        per_layer_s_init = jtu.tree_map(lambda s: s / 2.0, s_init)
+        per_layer_state = per_layer_tuner.init(per_layer_s_init)
+
+        scalar_s_init = util.tree_reduce_mean(s_init) / 2.0
+
+        scalar_state = scalar_tuner.init(scalar_s_init)
+
+        return CombinedTunerState(
+            per_layer_state=per_layer_state,
+            scalar_state=scalar_state,
+            per_layer_s_values=util.tree_copy(per_layer_s_init),
+            scalar_s_values=util.tree_copy(scalar_s_init),
+        )
+
+    def update_fn(
+        grad: optax.Updates, state: CombinedTunerState, prev_s_values: optax.Params
+    ):
+        per_layer_state = state.per_layer_state
+        scalar_state = state.scalar_state
+
+        per_layer_update, next_per_layer_state = per_layer_tuner.update(
+            grad, state.per_layer_state, state.per_layer_s_values
+        )
+
+        next_per_layer_s_values = optax.apply_updates(
+            state.per_layer_s_values, per_layer_update
+        )
+
+        scalar_grad = util.tree_reduce_sum(grad)
+        scalar_update, next_scalar_state = scalar_tuner.update(
+            scalar_grad, state.scalar_state, state.scalar_s_values
+        )
+
+        next_scalar_s_values = optax.apply_updates(state.scalar_s_values, scalar_update)
+
+        final_update = jtu.tree_map(lambda u_i: u_i + scalar_update, per_layer_update)
+
+        return final_update, CombinedTunerState(
+            per_layer_state=next_per_layer_state,
+            scalar_state=next_scalar_state,
+            per_layer_s_values=next_per_layer_s_values,
+            scalar_s_values=next_scalar_s_values,
+        )
+
+    return optax.GradientTransformation(init_fn,update_fn)
+
+
 class MechanicState(NamedTuple):
     offset: optax.Updates  # this is the Delta in the paper.
     base_state: optax.OptState
@@ -521,6 +596,7 @@ def optax_like_mechanize(
     freeze_s_iteration: Optional[int] = None,
     tuner_lr: float = 1.0,
     tuner_decay_schedule="constant",
+    per_layer=False,
     **kwargs,
 ) -> optax.GradientTransformation:
     """
@@ -547,7 +623,12 @@ def optax_like_mechanize(
         'linear' (linear decay)
 
     """
-    tuner = optax_tuner(
+    if per_layer == 'combined':
+        tuner_fn = combined_per_layer_optax_tuner
+    else:
+        tuner_fn = optax_tuner
+            
+    tuner = tuner_fn(
         betas=betas,
         num_iter=num_iter,
         betas2=betas2,
@@ -556,8 +637,9 @@ def optax_like_mechanize(
     return mechanize(
         base_optimizer,
         tuner_optimizer=tuner,
-        s_init=s_init/len(betas),
+        s_init=s_init / len(betas),
         weight_decay=weight_decay,
+        per_layer=per_layer,
         **kwargs,
     )
 
@@ -574,6 +656,7 @@ def mechanize(
     freeze_s_iteration: Optional[int] = None,
     tuner_lr: float = 1.0,
     tuner_decay_schedule="constant",
+    incremental: Optional[str] = None,
 ) -> optax.GradientTransformation:
     """
     Args:
@@ -594,13 +677,15 @@ def mechanize(
     tuner_decay_schedule: schedule to apply to the tuner updates. Can be:
         'constant' (no schedule)
         'linear' (linear decay)
+    incremental: if not None, specifies a mode for incremental updates. Current options:
+        'greedy': use the same way to update s values, but just don't rescale the entire offset.
     """
 
     if base_offset_decay is None:
-        if averaging_momentum != 'iter_count':
+        if averaging_momentum != "iter_count":
             base_offset_decay = 1.0 - averaging_momentum
         else:
-            base_offset_decay = 'iter_count'
+            base_offset_decay = "iter_count"
 
     if tuner_decay_schedule == "constant":
         tuner_decay_fn = lambda t, updates: jtu.tree_map(
@@ -661,16 +746,14 @@ def mechanize(
         base_updates, next_base_state = base_optimizer.update(grads, base_state, params)
         # base updates is "u" in the paper. Add this to Delta to get the next
         # value of Delta.
-        next_offset = tree_add(offset, base_updates)
-        # if base_offset_decay == 'iter_count':
-        #     offset_beta = 1.0 - 1.0/(iter_count + 1)
-        # else:
-        #     offset_beta = base_offset_decay
-        # next_offset = jtu.tree_map(
-        #     lambda o_i, b_i: offset_beta * o_i + b_i,
-        #     offset,
-        #     base_updates
-        # )
+        # next_offset = tree_add(offset, base_updates)
+        if base_offset_decay == "iter_count":
+            offset_beta = 1.0 - 1.0 / (iter_count + 1)
+        else:
+            offset_beta = base_offset_decay
+        next_offset = jtu.tree_map(
+            lambda o_i, b_i: offset_beta * o_i + b_i, offset, base_updates
+        )
 
         if not per_layer:
             inner_product = tree_dot(
@@ -749,9 +832,12 @@ def mechanize(
                 avmom = averaging_momentum
 
             # update to  apply if we are still updating s
-            standard_update = (
-                base_i * s + next_offset_i * s_update + offset_i * s * avmom
-            )
+            if incremental == "greedy":
+                standard_update = base_i * s + offset_i * s * avmom
+            else:
+                standard_update = (
+                    base_i * s + next_offset_i * s_update + offset_i * s * avmom
+                )
 
             # update to apply if we have stopped updating s
             frozen_update = base_i * s + offset_i * s * avmom
