@@ -159,7 +159,11 @@ def schedule_momentum(
 
         max_iter: how many iterates to train for. If provided, will force
             alpha = 0 for the final update, thus providing a last-iterate
-            guarantee
+            guarantee.
+            Actually, it's fine (in theory) for this to be an underestimate of
+            the actual number of iterateions: we will just continue setting
+            alpha=0 for any iterations greater than this max_iter which
+            will continue to have a last-iterate guarantee.
 
         alpha_state:
             internal state for the alpha generating function. Not needed 
