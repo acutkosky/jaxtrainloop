@@ -51,7 +51,7 @@ def add_noise(sigma: float, key: jax.Array):
 
 def all_finite(tree: PyTree) -> jax.Array:
     tree = jtu.tree_map(lambda x: jnp.all(jnp.isfinite(x)), tree)
-    leaves = jtu.tree_leaves(tree)
+    leaves = jtu.tree_flatten(tree)[0]
     return jnp.all(jnp.array(leaves))
 
 

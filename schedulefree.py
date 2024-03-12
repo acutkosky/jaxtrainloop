@@ -191,6 +191,7 @@ def schedule_momentum(
 
     """
 
+
     if base_optimizer is None:
         base_optimizer = pass_through_transform()
 
@@ -255,11 +256,7 @@ def schedule_momentum(
             # will cause the algorithm to switch to primal/anytime averaging.
             # In theory, every iterate after that this point is a "good"
             # eval iterate.
-            next_alpha, next_alpha_state = jax.lax.cond(
-                    next_iter_count < max_iter,
-                    lambda: (next_alpha, next_alpha_state),
-                    lambda: (0.0, state.alpha_state)
-                )
+            next_alpha = next_alpha * (next_iter_count < max_iter)
     
 
         next_weight, next_weight_state = weight_fn(grads, state, params, base_updates)
