@@ -157,10 +157,13 @@ def train_step(
     if config.averaging == "polyak":
         aux['polyak'] = update_average(model, state, aux['polyak'], time["train"].it + 1)
 
-
     if config.log_norms:
         log_data["norms/grads"] = tree_norm(grads)
-        log_data["norms/params"] = tree_norm(model)
+        # extract the trainable params in this hacky way
+        # (sometimes the model might have some array that counts iterationns or something
+        # that would throw off a norm calculuation)
+        model_params = eqx.filter(model, jtu.tree_map(eqx.is_array, grads))
+        log_data["norms/params"] = tree_norm(model_params)
 
     new_train_state = TrainState(
         model=ModelAndState(model=model, state=state),
@@ -430,11 +433,10 @@ def train(config: DictConfig, data_loaders=None, model_state=None, optimizer_sta
     else:
         dynamic_scaler_state = None
 
+    aux = {}
     if config.train.averaging is not None and config.train.averaging != "none":
-        aux = {'polyak': copy_arrays(model_state)}
+        aux['polyak'] = copy_arrays(model_state)
         # ModelAndState(model=model, state=state))
-    else:
-        aux = {}
 
     train_time = duration.TrainTime(name="train")
     valid_time = duration.TrainTime(name="valid")

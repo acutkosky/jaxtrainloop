@@ -17,6 +17,13 @@ batch_size: 4 # number of examples placed on each GPU
 
 accumulation_steps: 1
 
+use_schedule_momentum: false
+schedule_momentum:
+  alpha: 0.9
+
+direction_learner:
+  granularity: global
+
 # options for exponential balancer
 do_exp_balancing: False
 exp_balancing:

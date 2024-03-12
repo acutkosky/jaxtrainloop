@@ -20,6 +20,8 @@ import cocob
 from precondition_opt import vector_preconditioned_momentum
 import exponential_balancer
 import simplified_mechanic
+import direction_learner
+import schedulefree
 
 
 class NoiseState(NamedTuple):
@@ -49,7 +51,7 @@ def add_noise(sigma: float, key: jax.Array):
 
 def all_finite(tree: PyTree) -> jax.Array:
     tree = jtu.tree_map(lambda x: jnp.all(jnp.isfinite(x)), tree)
-    leaves = jtu.tree_flatten(tree)[0]
+    leaves = jtu.tree_leaves(tree)
     return jnp.all(jnp.array(leaves))
 
 
@@ -432,6 +434,10 @@ def get_optimizer(
             b2=opt_config.beta2,
             weight_decay=opt_config.weight_decay,
         )
+    elif opt_config.name == "direction":
+        optimizer = direction_learner.sign_direction_learner(
+            opt_config.direction_learner.granularity
+        )
     elif opt_config.name == "opt_adam":
         optimizer = optadam.opt_adam(
             lr=1.0,
@@ -582,6 +588,12 @@ def get_optimizer(
         # if not opt_config.mechanize:
         #     optimizer = optax.chain(optimizer, optax.scale(opt_config.lr))
 
+    if opt_config.use_schedule_momentum:
+        optimizer = schedulefree.schedule_momentum(
+            alpha=opt_config.schedule_momentum.alpha,
+            base_optimizer=optimizer
+        )
+
     if config.get("gradient_noise", 0) != 0:
         optimizer = optax.chain(
             add_noise(config.gradient_noise, jax.random.PRNGKey(1231)), optimizer
@@ -598,6 +610,7 @@ def get_optimizer(
     if opt_config.get("random_scale_type", "none") != "none":
         key = jax.random.PRNGKey(88)
         optimizer = otnc.random_scale(opt_config.random_scale_type, key, optimizer)
+
 
     # optimizer = optax.apply_if_finite(optimizer, 15)
     optimizer = skip_nonfinite(optimizer)
